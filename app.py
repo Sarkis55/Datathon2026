@@ -1,8 +1,11 @@
 # =========================================================
 # Streamlit App: Datathon 2026 Dashboard
-# Reads graduate-full.csv.zip directly from GitHub
-# Full version with Q1-Q4, model presentation, policy view,
-# AI-style wage simulator, and model comparison
+# Cloud-optimized full version
+# - Loads graduate-full.csv.zip directly from GitHub
+# - Answers Q1-Q4
+# - Shows visualizations
+# - Includes user-facing prediction and model comparison
+# - Optimized for Streamlit Cloud performance
 # =========================================================
 
 import io
@@ -28,9 +31,14 @@ st.set_page_config(
 )
 
 # -----------------------------
-# GitHub raw ZIP URL
+# Config
 # -----------------------------
 ZIP_URL = "https://raw.githubusercontent.com/Sarkis55/Datathon2026/main/graduate-full.csv.zip"
+
+MAX_MODEL_ROWS_MAIN = 12000
+MAX_MODEL_ROWS_LAG = 10000
+MAX_SCATTER_POINTS = 6000
+MAX_PREVIEW_ROWS = 50
 
 # -----------------------------
 # Utility helpers
@@ -61,6 +69,9 @@ def star_from_p(p):
         return "*"
     return ""
 
+def safe_first(seq, fallback):
+    return seq[0] if len(seq) > 0 else fallback
+
 def human_term(term):
     mapping = {
         "female": "Female",
@@ -72,6 +83,20 @@ def human_term(term):
         "Year_num": "Year trend"
     }
     return mapping.get(term, term)
+
+def make_model_sample(df, max_rows, seed=42):
+    if df is None or len(df) == 0:
+        return df
+    if len(df) <= max_rows:
+        return df.copy()
+    return df.sample(max_rows, random_state=seed).copy()
+
+def maybe_sample_for_scatter(df, max_rows=MAX_SCATTER_POINTS, seed=42):
+    if df is None or len(df) == 0:
+        return df
+    if len(df) <= max_rows:
+        return df.copy()
+    return df.sample(max_rows, random_state=seed).copy()
 
 # -----------------------------
 # Data loading
@@ -93,6 +118,9 @@ def load_data_from_github_zip(zip_url: str) -> pd.DataFrame:
 
     return df
 
+# -----------------------------
+# Preprocessing
+# -----------------------------
 @st.cache_data(show_spinner=True)
 def preprocess_data(df_raw: pd.DataFrame):
     df = df_raw.copy()
@@ -113,12 +141,14 @@ def preprocess_data(df_raw: pd.DataFrame):
         if col in df.columns:
             df[col] = pd.to_datetime(df[col], errors="coerce")
 
+    # Core cleaning
     if "Employed" in df.columns:
         df = df[df["Employed"] == 1].copy()
 
     df = df[df["HRLY_WAGE"].notna()].copy()
     df = df[df["HRLY_WAGE"] > 0].copy()
 
+    # Trim extreme wages
     wage_low = df["HRLY_WAGE"].quantile(0.01)
     wage_high = df["HRLY_WAGE"].quantile(0.99)
     df = df[(df["HRLY_WAGE"] >= wage_low) & (df["HRLY_WAGE"] <= wage_high)].copy()
@@ -129,6 +159,7 @@ def preprocess_data(df_raw: pd.DataFrame):
     if "TENURE" in df.columns:
         df = df[(df["TENURE"].isna()) | (df["TENURE"] >= 0)].copy()
 
+    # Features
     if "SAMPLE_SEX_1997" in df.columns:
         df["female"] = np.where(df["SAMPLE_SEX_1997"] == 2, 1, 0)
         sex_map = {1: "Male", 2: "Female"}
@@ -178,9 +209,17 @@ def preprocess_data(df_raw: pd.DataFrame):
         df["marital_status"] = -1
     df["marital_status"] = df["marital_status"].fillna(-1)
 
+    if "HGC" not in df.columns:
+        df["HGC"] = np.nan
+    if "TENURE" not in df.columns:
+        df["TENURE"] = np.nan
+    if "HRS_WRK" not in df.columns:
+        df["HRS_WRK"] = np.nan
+
     df["Year_num"] = df["Year"] if "Year" in df.columns else np.nan
     df["post_2018"] = np.where(df["Year_num"] >= 2018, 1, 0)
 
+    # Sort and prior wage
     sort_cols = []
     if "PUBID_1997" in df.columns:
         sort_cols.append("PUBID_1997")
@@ -189,7 +228,7 @@ def preprocess_data(df_raw: pd.DataFrame):
     if "Interview_Date" in df.columns:
         sort_cols.append("Interview_Date")
 
-    if sort_cols:
+    if len(sort_cols) > 0:
         df = df.sort_values(sort_cols).copy()
 
     if "PUBID_1997" in df.columns:
@@ -209,15 +248,23 @@ def preprocess_data(df_raw: pd.DataFrame):
     if "year_gap" in df_lag.columns:
         df_lag = df_lag[(df_lag["year_gap"].isna()) | (df_lag["year_gap"] <= 3)].copy()
 
-    year_gender = (
-        df.groupby(["Year", "sex_label"], as_index=False)
-          .agg(
-              mean_wage=("HRLY_WAGE", "mean"),
-              median_wage=("HRLY_WAGE", "median"),
-              n=("HRLY_WAGE", "size")
-          )
-        if "Year" in df.columns else pd.DataFrame()
-    )
+    return df, df_lag
+
+# -----------------------------
+# Summary tables
+# -----------------------------
+@st.cache_data(show_spinner=True)
+def build_summaries(df, df_lag):
+    year_gender = pd.DataFrame()
+    if "Year" in df.columns:
+        year_gender = (
+            df.groupby(["Year", "sex_label"], as_index=False)
+              .agg(
+                  mean_wage=("HRLY_WAGE", "mean"),
+                  median_wage=("HRLY_WAGE", "median"),
+                  n=("HRLY_WAGE", "size")
+              )
+        )
 
     occupation_gap = (
         df.groupby(["Occupation_Group2", "sex_label"], as_index=False)
@@ -241,132 +288,106 @@ def preprocess_data(df_raw: pd.DataFrame):
         industry_pivot["female_to_male_ratio"] = np.nan
     industry_pivot = industry_pivot.reset_index()
 
-    return df, df_lag, year_gender, occupation_pivot, industry_pivot
+    prior_scatter = df_lag.copy()
+    if len(prior_scatter) > 0:
+        prior_scatter = prior_scatter[
+            (prior_scatter["HRLY_WAGE"] <= prior_scatter["HRLY_WAGE"].quantile(0.99)) &
+            (prior_scatter["prior_wage"] <= prior_scatter["prior_wage"].quantile(0.99))
+        ].copy()
+        prior_scatter = maybe_sample_for_scatter(prior_scatter, max_rows=MAX_SCATTER_POINTS)
+
+    return year_gender, occupation_pivot, industry_pivot, prior_scatter
 
 # -----------------------------
 # Modeling
 # -----------------------------
 def fit_ols(formula, data):
     try:
-        model = smf.ols(formula=formula, data=data).fit(cov_type="HC3")
+        model = smf.ols(formula=formula, data=data).fit()
         return model
     except Exception:
         return None
 
 @st.cache_resource(show_spinner=True)
 def fit_models(df, df_lag):
+    """
+    Cloud-safe model fitting:
+    - samples smaller subsets
+    - uses Year_num instead of year fixed effects
+    - keeps a small but meaningful model set
+    """
     models = {}
 
-    models["M1"] = fit_ols(
-        """
-        ln_wage ~ female + age + age_sq + HGC + TENURE + HRS_WRK
-                + C(race_label) + C(region_label) + C(Year)
-        """,
-        df
-    )
+    df_m = make_model_sample(df, MAX_MODEL_ROWS_MAIN, seed=42)
+    df_lag_m = make_model_sample(df_lag, MAX_MODEL_ROWS_LAG, seed=42)
 
-    models["M2"] = fit_ols(
-        """
-        ln_wage ~ female + age + age_sq + HGC + TENURE + HRS_WRK
-                + C(race_label) + C(region_label) + C(marital_status) + C(Year)
-        """,
-        df
-    )
-
-    models["M3"] = fit_ols(
-        """
-        ln_wage ~ female + age + age_sq + HGC + TENURE + HRS_WRK
-                + C(race_label) + C(region_label) + C(marital_status)
-                + C(Occupation_Group2) + C(Industry_Group) + C(Year)
-        """,
-        df
-    )
-
-    models["M4"] = fit_ols(
-        """
-        ln_wage ~ ln_prior_wage + female + age + age_sq + HGC + TENURE + HRS_WRK
-                + C(race_label) + C(region_label) + C(marital_status) + C(Year)
-        """,
-        df_lag
-    )
-
-    models["M5"] = fit_ols(
-        """
-        ln_wage ~ ln_prior_wage * female + age + age_sq + HGC + TENURE + HRS_WRK
-                + C(race_label) + C(region_label) + C(marital_status)
-                + C(Occupation_Group2) + C(Industry_Group) + C(Year)
-        """,
-        df_lag
-    )
-
-    models["M6"] = fit_ols(
-        """
-        ln_wage ~ ln_prior_wage * post_2018 + female + age + age_sq + HGC + TENURE + HRS_WRK
-                + C(race_label) + C(region_label) + C(marital_status)
-                + C(Occupation_Group2) + C(Industry_Group) + C(Year)
-        """,
-        df_lag
-    )
-
-    models["M7"] = fit_ols(
-        """
-        ln_wage ~ ln_prior_wage + female * post_2018 + age + age_sq + HGC + TENURE + HRS_WRK
-                + C(race_label) + C(region_label) + C(marital_status)
-                + C(Occupation_Group2) + C(Industry_Group) + C(Year)
-        """,
-        df_lag
-    )
-
-    models["M8"] = fit_ols(
-        """
-        ln_wage ~ ln_prior_wage * female * post_2018 + age + age_sq + HGC + TENURE + HRS_WRK
-                + C(race_label) + C(region_label) + C(marital_status)
-                + C(Occupation_Group2) + C(Industry_Group) + C(Year)
-        """,
-        df_lag
-    )
-
-    models["F_Q1"] = fit_ols(
+    # Q1 full controls
+    models["M_Q1"] = fit_ols(
         """
         ln_wage ~ female + age + age_sq + HGC + TENURE + HRS_WRK + Year_num
                 + C(race_label) + C(region_label) + C(marital_status)
                 + C(Occupation_Group2) + C(Industry_Group)
         """,
-        df
+        df_m
     )
 
-    models["F_Q2"] = fit_ols(
+    # Q2 prior wage
+    models["M_Q2"] = fit_ols(
+        """
+        ln_wage ~ ln_prior_wage + female + age + age_sq + HGC + TENURE + HRS_WRK + Year_num
+                + C(race_label) + C(region_label) + C(marital_status)
+                + C(Occupation_Group2) + C(Industry_Group)
+        """,
+        df_lag_m
+    )
+
+    # Q2 interaction
+    models["M_Q2_INT"] = fit_ols(
         """
         ln_wage ~ ln_prior_wage * female + age + age_sq + HGC + TENURE + HRS_WRK + Year_num
                 + C(race_label) + C(region_label) + C(marital_status)
                 + C(Occupation_Group2) + C(Industry_Group)
         """,
-        df_lag
+        df_lag_m
     )
 
-    models["F_Q3"] = fit_ols(
+    # Q3 policy
+    models["M_Q3"] = fit_ols(
+        """
+        ln_wage ~ ln_prior_wage * post_2018 + female + age + age_sq + HGC + TENURE + HRS_WRK + Year_num
+                + C(race_label) + C(region_label) + C(marital_status)
+                + C(Occupation_Group2) + C(Industry_Group)
+        """,
+        df_lag_m
+    )
+
+    # Q3 triple interaction
+    models["M_Q3_TRIPLE"] = fit_ols(
         """
         ln_wage ~ ln_prior_wage * female * post_2018 + age + age_sq + HGC + TENURE + HRS_WRK + Year_num
                 + C(race_label) + C(region_label) + C(marital_status)
                 + C(Occupation_Group2) + C(Industry_Group)
         """,
-        df_lag
+        df_lag_m
     )
+
+    # Forecast models reused by simulator
+    models["F_BASE"] = models["M_Q1"]
+    models["F_PRIOR"] = models["M_Q2_INT"]
+    models["F_POLICY"] = models["M_Q3_TRIPLE"]
 
     return models
 
+@st.cache_data(show_spinner=False)
 def extract_model_table(models):
     rows = []
 
     model_meta = {
-        "M1": ("Q1", "Baseline gender gap model"),
-        "M2": ("Q1", "Add marital status"),
-        "M3": ("Q1", "Full controls model"),
-        "M4": ("Q2", "Prior wage model"),
-        "M5": ("Q2", "Prior wage × female model"),
-        "M6": ("Q3", "Prior wage × post-2018 model"),
-        "M7": ("Q3", "Female × post-2018 model"),
-        "M8": ("Q3", "Triple interaction model"),
+        "M_Q1": ("Q1", "Gender pay gap full model"),
+        "M_Q2": ("Q2", "Prior wage model"),
+        "M_Q2_INT": ("Q2", "Prior wage × female model"),
+        "M_Q3": ("Q3", "Prior wage × post-2018 model"),
+        "M_Q3_TRIPLE": ("Q3", "Triple interaction model"),
     }
 
     terms_to_keep = [
@@ -375,7 +396,8 @@ def extract_model_table(models):
         "ln_prior_wage:female",
         "ln_prior_wage:post_2018",
         "female:post_2018",
-        "ln_prior_wage:female:post_2018"
+        "ln_prior_wage:female:post_2018",
+        "Year_num"
     ]
 
     for model_name, meta in model_meta.items():
@@ -409,8 +431,26 @@ def extract_model_table(models):
     return pd.DataFrame(rows)
 
 # -----------------------------
-# Filtering and summaries
+# Filter helpers
 # -----------------------------
+def filter_main_data(df, year_range, selected_gender, selected_race, selected_region):
+    filtered = df.copy()
+    if year_range is not None:
+        filtered = filtered[(filtered["Year"] >= year_range[0]) & (filtered["Year"] <= year_range[1])]
+    filtered = filtered[filtered["sex_label"].isin(selected_gender)]
+    filtered = filtered[filtered["race_label"].isin(selected_race)]
+    filtered = filtered[filtered["region_label"].isin(selected_region)]
+    return filtered
+
+def filter_lag_data(df_lag, year_range, selected_gender, selected_race, selected_region):
+    filtered = df_lag.copy()
+    if year_range is not None and "Year" in filtered.columns:
+        filtered = filtered[(filtered["Year"] >= year_range[0]) & (filtered["Year"] <= year_range[1])]
+    filtered = filtered[filtered["sex_label"].isin(selected_gender)]
+    filtered = filtered[filtered["race_label"].isin(selected_race)]
+    filtered = filtered[filtered["region_label"].isin(selected_region)]
+    return filtered
+
 def build_summary_cards(df_filtered):
     male_mean = df_filtered.loc[df_filtered["sex_label"] == "Male", "HRLY_WAGE"].mean()
     female_mean = df_filtered.loc[df_filtered["sex_label"] == "Female", "HRLY_WAGE"].mean()
@@ -422,56 +462,56 @@ def build_summary_cards(df_filtered):
 
     return male_mean, female_mean, raw_gap_pct
 
+# -----------------------------
+# Interpretations
+# -----------------------------
 def get_top_interpretations(results_table):
-    q1_row = results_table[(results_table["model"] == "M3") & (results_table["term"] == "female")]
-    q2_row = results_table[(results_table["model"] == "M4") & (results_table["term"] == "ln_prior_wage")]
-    q2_row2 = results_table[(results_table["model"] == "M5") & (results_table["term"] == "ln_prior_wage:female")]
-    q3_row = results_table[(results_table["model"] == "M6") & (results_table["term"] == "ln_prior_wage:post_2018")]
-
     messages = []
 
-    if not q1_row.empty:
-        coef = q1_row.iloc[0]["coefficient"]
-        pct = safe_exp_pct(coef)
-        messages.append(f"Q1: In the full model, the female coefficient is {coef:.4f}, implying about {pct:.2f}% lower wages for women with similar observed characteristics.")
+    try:
+        q1_row = results_table[(results_table["model"] == "M_Q1") & (results_table["term"] == "female")]
+        if not q1_row.empty:
+            coef = q1_row.iloc[0]["coefficient"]
+            pct = safe_exp_pct(coef)
+            messages.append(
+                f"Q1: In the full cloud-safe model, the female coefficient is {coef:.4f}, implying about {pct:.2f}% lower wages for women with similar observed characteristics."
+            )
+    except Exception:
+        pass
 
-    if not q2_row.empty:
-        coef = q2_row.iloc[0]["coefficient"]
-        messages.append(f"Q2: Current wage remains strongly related to prior wage. The log prior wage coefficient is {coef:.4f} in the main prior-pay model.")
+    try:
+        q2_row = results_table[(results_table["model"] == "M_Q2") & (results_table["term"] == "ln_prior_wage")]
+        if not q2_row.empty:
+            coef = q2_row.iloc[0]["coefficient"]
+            messages.append(
+                f"Q2: Current wage remains strongly related to prior wage. The log prior wage coefficient is {coef:.4f}."
+            )
+    except Exception:
+        pass
 
-    if not q2_row2.empty:
-        coef = q2_row2.iloc[0]["coefficient"]
-        p = q2_row2.iloc[0]["p_value"]
-        messages.append(f"Q2: The prior wage × female interaction is {coef:.4f} with p-value {p:.3f}, so the slope difference by gender is limited in this specification.")
+    try:
+        q2_row2 = results_table[(results_table["model"] == "M_Q2_INT") & (results_table["term"] == "ln_prior_wage:female")]
+        if not q2_row2.empty:
+            coef = q2_row2.iloc[0]["coefficient"]
+            p = q2_row2.iloc[0]["p_value"]
+            messages.append(
+                f"Q2: The prior wage × female interaction is {coef:.4f} with p-value {p:.3f}, so the slope difference by gender is limited in this interactive approximation."
+            )
+    except Exception:
+        pass
 
-    if not q3_row.empty:
-        coef = q3_row.iloc[0]["coefficient"]
-        p = q3_row.iloc[0]["p_value"]
-        messages.append(f"Q3: The post-2018 prior wage interaction is {coef:.4f} with p-value {p:.3f}. The prior-current wage relationship does not collapse to zero.")
+    try:
+        q3_row = results_table[(results_table["model"] == "M_Q3") & (results_table["term"] == "ln_prior_wage:post_2018")]
+        if not q3_row.empty:
+            coef = q3_row.iloc[0]["coefficient"]
+            p = q3_row.iloc[0]["p_value"]
+            messages.append(
+                f"Q3: The post-2018 prior wage interaction is {coef:.4f} with p-value {p:.3f}. The prior-current wage relationship does not collapse to zero."
+            )
+    except Exception:
+        pass
 
     return messages
-
-def filter_main_data(df, year_range, selected_gender, selected_race, selected_region):
-    filtered = df.copy()
-
-    if year_range is not None:
-        filtered = filtered[(filtered["Year"] >= year_range[0]) & (filtered["Year"] <= year_range[1])]
-
-    filtered = filtered[filtered["sex_label"].isin(selected_gender)]
-    filtered = filtered[filtered["race_label"].isin(selected_race)]
-    filtered = filtered[filtered["region_label"].isin(selected_region)]
-    return filtered
-
-def filter_lag_data(df_lag, year_range, selected_gender, selected_race, selected_region):
-    lag_filtered = df_lag.copy()
-
-    if year_range is not None and "Year" in lag_filtered.columns:
-        lag_filtered = lag_filtered[(lag_filtered["Year"] >= year_range[0]) & (lag_filtered["Year"] <= year_range[1])]
-
-    lag_filtered = lag_filtered[lag_filtered["sex_label"].isin(selected_gender)]
-    lag_filtered = lag_filtered[lag_filtered["race_label"].isin(selected_race)]
-    lag_filtered = lag_filtered[lag_filtered["region_label"].isin(selected_region)]
-    return lag_filtered
 
 # -----------------------------
 # Simulator helpers
@@ -515,11 +555,14 @@ def build_profile_row(
     return row
 
 def predict_wage_path(model, horizons, base_inputs):
-    output_rows = []
+    rows = []
+    if model is None:
+        return pd.DataFrame()
+
     for h in horizons:
-        yr = int(base_inputs["year_value"] + h)
+        year_value = int(base_inputs["year_value"] + h)
         row = build_profile_row(
-            year_value=yr,
+            year_value=year_value,
             sex_label=base_inputs["sex_label"],
             race_label=base_inputs["race_label"],
             region_label=base_inputs["region_label"],
@@ -534,56 +577,17 @@ def predict_wage_path(model, horizons, base_inputs):
         )
         pred_ln = float(model.predict(row)[0])
         pred_wage = float(np.exp(pred_ln))
-        output_rows.append({
+        rows.append({
             "horizon_years": h,
-            "projected_year": yr,
-            "predicted_ln_wage": pred_ln,
+            "projected_year": year_value,
             "predicted_wage": pred_wage
         })
-    return pd.DataFrame(output_rows)
-
-def compare_model_predictions(models, base_inputs):
-    compare_rows = []
-
-    mapping = {
-        "Q1 Full Controls Forecast Model": "F_Q1",
-        "Q2 Prior Wage Forecast Model": "F_Q2",
-        "Q3 Policy Forecast Model": "F_Q3"
-    }
-
-    for display_name, model_key in mapping.items():
-        model = models.get(model_key)
-        if model is None:
-            continue
-
-        row = build_profile_row(
-            year_value=base_inputs["year_value"],
-            sex_label=base_inputs["sex_label"],
-            race_label=base_inputs["race_label"],
-            region_label=base_inputs["region_label"],
-            marital_status=base_inputs["marital_status"],
-            age=base_inputs["age"],
-            hgc=base_inputs["hgc"],
-            tenure=base_inputs["tenure"],
-            hrs_wrk=base_inputs["hrs_wrk"],
-            occupation_group=base_inputs["occupation_group"],
-            industry_group=base_inputs["industry_group"],
-            prior_wage=base_inputs["prior_wage"]
-        )
-
-        pred_ln = float(model.predict(row)[0])
-        pred_wage = float(np.exp(pred_ln))
-
-        compare_rows.append({
-            "model": display_name,
-            "predicted_wage": pred_wage,
-            "r_squared": getattr(model, "rsquared", np.nan),
-            "nobs": int(getattr(model, "nobs", np.nan))
-        })
-
-    return pd.DataFrame(compare_rows)
+    return pd.DataFrame(rows)
 
 def same_profile_gender_comparison(model, base_inputs):
+    if model is None:
+        return pd.DataFrame()
+
     rows = []
     for sex_label in ["Male", "Female"]:
         row = build_profile_row(
@@ -601,14 +605,16 @@ def same_profile_gender_comparison(model, base_inputs):
             prior_wage=base_inputs["prior_wage"]
         )
         pred_ln = float(model.predict(row)[0])
-        pred_wage = float(np.exp(pred_ln))
         rows.append({
             "sex_label": sex_label,
-            "predicted_wage": pred_wage
+            "predicted_wage": float(np.exp(pred_ln))
         })
     return pd.DataFrame(rows)
 
 def prior_wage_policy_comparison(model_with_prior, model_without_prior, base_inputs):
+    if model_with_prior is None or model_without_prior is None:
+        return pd.DataFrame()
+
     rows = []
 
     row_with = build_profile_row(
@@ -626,10 +632,7 @@ def prior_wage_policy_comparison(model_with_prior, model_without_prior, base_inp
         prior_wage=base_inputs["prior_wage"]
     )
     pred_with = float(np.exp(model_with_prior.predict(row_with)[0]))
-    rows.append({
-        "scenario": "With prior wage information",
-        "predicted_wage": pred_with
-    })
+    rows.append({"scenario": "With prior wage information", "predicted_wage": pred_with})
 
     row_without = build_profile_row(
         year_value=base_inputs["year_value"],
@@ -646,16 +649,15 @@ def prior_wage_policy_comparison(model_with_prior, model_without_prior, base_inp
         prior_wage=max(base_inputs["prior_wage"], 1e-6)
     )
     pred_without = float(np.exp(model_without_prior.predict(row_without)[0]))
-    rows.append({
-        "scenario": "Without prior wage information",
-        "predicted_wage": pred_without
-    })
+    rows.append({"scenario": "Without prior wage information", "predicted_wage": pred_without})
 
     return pd.DataFrame(rows)
 
 def pre_post_policy_comparison(model_policy, base_inputs):
-    rows = []
+    if model_policy is None:
+        return pd.DataFrame()
 
+    rows = []
     for yr in [2017, 2021]:
         row = build_profile_row(
             year_value=yr,
@@ -677,24 +679,76 @@ def pre_post_policy_comparison(model_policy, base_inputs):
             "year_used": yr,
             "predicted_wage": pred
         })
+    return pd.DataFrame(rows)
+
+def compare_model_predictions(models, base_inputs):
+    rows = []
+
+    mapping = {
+        "Baseline wage model": "F_BASE",
+        "Prior wage model": "F_PRIOR",
+        "Policy interaction model": "F_POLICY"
+    }
+
+    for label, key in mapping.items():
+        model = models.get(key)
+        if model is None:
+            continue
+
+        row = build_profile_row(
+            year_value=base_inputs["year_value"],
+            sex_label=base_inputs["sex_label"],
+            race_label=base_inputs["race_label"],
+            region_label=base_inputs["region_label"],
+            marital_status=base_inputs["marital_status"],
+            age=base_inputs["age"],
+            hgc=base_inputs["hgc"],
+            tenure=base_inputs["tenure"],
+            hrs_wrk=base_inputs["hrs_wrk"],
+            occupation_group=base_inputs["occupation_group"],
+            industry_group=base_inputs["industry_group"],
+            prior_wage=base_inputs["prior_wage"]
+        )
+        pred = float(np.exp(model.predict(row)[0]))
+        rows.append({
+            "model": label,
+            "predicted_wage": pred,
+            "r_squared": getattr(model, "rsquared", np.nan),
+            "nobs": int(getattr(model, "nobs", np.nan))
+        })
 
     return pd.DataFrame(rows)
 
 # -----------------------------
-# Load data and models
+# Load everything
 # -----------------------------
 st.title("Datathon 2026 Dashboard")
-st.caption("Gender pay gap, prior pay analysis, policy interpretation, and AI-style wage projection")
+st.caption("Gender pay gap, prior salary effects, policy interpretation, and user-facing wage prediction")
 
-with st.spinner("Loading data from GitHub and preparing the dashboard..."):
+with st.spinner("Loading data, summaries, and cloud-safe models..."):
     df_raw = load_data_from_github_zip(ZIP_URL)
-    df, df_lag, year_gender, occupation_pivot, industry_pivot = preprocess_data(df_raw)
+    df, df_lag = preprocess_data(df_raw)
+    year_gender, occupation_pivot, industry_pivot, prior_scatter = build_summaries(df, df_lag)
     models = fit_models(df, df_lag)
     results_table = extract_model_table(models)
 
 # -----------------------------
-# Sidebar filters
+# Sidebar
 # -----------------------------
+st.sidebar.header("Navigation")
+page = st.sidebar.radio(
+    "Go to",
+    [
+        "Overview",
+        "Q1 Gender Pay Gap",
+        "Q2 Prior Salary and Ban",
+        "Q3 Post-2018 Policy",
+        "Q4 Hidden Factors and Limits",
+        "AI Wage Simulator",
+        "Data Preview"
+    ]
+)
+
 st.sidebar.header("Global Filters")
 
 if "Year" in df.columns and df["Year"].notna().any():
@@ -719,46 +773,40 @@ lag_filtered = filter_lag_data(df_lag, year_range, selected_gender, selected_rac
 male_mean, female_mean, raw_gap_pct = build_summary_cards(filtered)
 
 # -----------------------------
-# KPI cards
+# KPI row
 # -----------------------------
-k1, k2, k3, k4, k5 = st.columns(5)
-k1.metric("Observations", f"{len(filtered):,}")
-k2.metric("Individuals", f"{filtered['PUBID_1997'].nunique():,}" if "PUBID_1997" in filtered.columns else "N/A")
-k3.metric("Average hourly wage", f"{filtered['HRLY_WAGE'].mean():.2f}" if len(filtered) else "N/A")
-k4.metric("Male average wage", f"{male_mean:.2f}" if pd.notna(male_mean) else "N/A")
-k5.metric("Female average wage", f"{female_mean:.2f}" if pd.notna(female_mean) else "N/A")
+c1, c2, c3, c4, c5 = st.columns(5)
+c1.metric("Observations", f"{len(filtered):,}")
+c2.metric("Individuals", f"{filtered['PUBID_1997'].nunique():,}" if "PUBID_1997" in filtered.columns else "N/A")
+c3.metric("Average hourly wage", f"{filtered['HRLY_WAGE'].mean():.2f}" if len(filtered) else "N/A")
+c4.metric("Male average wage", f"{male_mean:.2f}" if pd.notna(male_mean) else "N/A")
+c5.metric("Female average wage", f"{female_mean:.2f}" if pd.notna(female_mean) else "N/A")
 
 st.metric("Raw female vs male wage gap (%)", f"{raw_gap_pct:.2f}%" if pd.notna(raw_gap_pct) else "N/A")
 
 # -----------------------------
-# Tabs
+# Page: Overview
 # -----------------------------
-tab0, tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
-    "Overview",
-    "Q1 Gender Pay Gap",
-    "Q2 Prior Salary and Ban",
-    "Q3 Post-2018 Policy",
-    "Q4 Hidden Factors and Limits",
-    "AI Wage Simulator",
-    "Data Preview"
-])
-
-# -----------------------------
-# Overview
-# -----------------------------
-with tab0:
+if page == "Overview":
     st.subheader("Executive Summary")
 
-    for msg in get_top_interpretations(results_table):
-        st.markdown(f"- {msg}")
+    msgs = get_top_interpretations(results_table)
+    if len(msgs) == 0:
+        st.warning("Model summaries are not available.")
+    else:
+        for msg in msgs:
+            st.markdown(f"- {msg}")
 
-    if "Year" in filtered.columns and len(filtered) > 0:
+    st.info(
+        "Performance note: Interactive models in this dashboard are cloud-safe approximations trained on sampled data for responsiveness. Descriptive charts use the cleaned full sample."
+    )
+
+    if len(filtered) > 0 and "Year" in filtered.columns:
         summary = (
             filtered.groupby(["Year", "sex_label"], as_index=False)["HRLY_WAGE"]
             .mean()
             .rename(columns={"HRLY_WAGE": "mean_wage"})
         )
-
         fig = px.line(
             summary,
             x="Year",
@@ -770,42 +818,45 @@ with tab0:
         st.plotly_chart(fig, use_container_width=True)
 
     st.subheader("Key Model Table")
-    display_cols = ["question", "model", "model_desc", "term_label", "coefficient", "std_error", "p_value", "nobs", "r_squared"]
-    st.dataframe(results_table[display_cols], use_container_width=True)
+    if len(results_table) > 0:
+        display_cols = ["question", "model", "model_desc", "term_label", "coefficient", "std_error", "p_value", "nobs", "r_squared"]
+        st.dataframe(results_table[display_cols], use_container_width=True)
+    else:
+        st.warning("No model results available.")
 
 # -----------------------------
-# Q1 Gender Pay Gap
+# Page: Q1
 # -----------------------------
-with tab1:
+elif page == "Q1 Gender Pay Gap":
     st.subheader("Question 1")
     st.markdown("**Is there evidence of pay discrimination between male and female employees?**")
 
     q1_results = results_table[results_table["question"] == "Q1"].copy()
 
-    q1_main = q1_results[(q1_results["model"] == "M3") & (q1_results["term"] == "female")]
+    q1_main = q1_results[(q1_results["model"] == "M_Q1") & (q1_results["term"] == "female")]
     if not q1_main.empty:
         coef = q1_main.iloc[0]["coefficient"]
         pct = safe_exp_pct(coef)
         p_val = q1_main.iloc[0]["p_value"]
         st.success(
-            f"Full model result: female coefficient = {coef:.4f}, approximately {pct:.2f}% lower wages for women with similar observed characteristics. p-value = {p_val:.4g}"
+            f"Interactive answer: the female coefficient is {coef:.4f}, which implies about {pct:.2f}% lower wages for women with similar observed characteristics. p-value = {p_val:.4g}"
         )
 
-    col_a, col_b = st.columns(2)
+    a, b = st.columns(2)
 
-    with col_a:
+    with a:
         fig_hist = px.histogram(
             filtered,
             x="HRLY_WAGE",
             color="sex_label",
             barmode="overlay",
             nbins=50,
-            title="Hourly Wage Distribution by Gender",
-            opacity=0.60
+            opacity=0.60,
+            title="Hourly Wage Distribution by Gender"
         )
         st.plotly_chart(fig_hist, use_container_width=True)
 
-    with col_b:
+    with b:
         trimmed = filtered[filtered["HRLY_WAGE"] <= filtered["HRLY_WAGE"].quantile(0.95)].copy()
         fig_box = px.box(
             trimmed,
@@ -816,77 +867,63 @@ with tab1:
         )
         st.plotly_chart(fig_box, use_container_width=True)
 
-    st.subheader("Q1 Regression Results")
-    st.dataframe(
-        q1_results[["model", "model_desc", "term_label", "coefficient", "std_error", "p_value", "nobs", "r_squared"]],
-        use_container_width=True
+    st.subheader("Occupation-Level Context")
+    occ_plot = occupation_pivot.dropna(subset=["female_to_male_ratio"]).copy()
+    occ_plot = occ_plot.sort_values("female_to_male_ratio").head(12)
+    fig_occ = px.bar(
+        occ_plot,
+        x="female_to_male_ratio",
+        y="Occupation_Group2",
+        orientation="h",
+        title="Lowest Female-to-Male Wage Ratios by Occupation Group"
     )
+    fig_occ.add_vline(x=1.0, line_dash="dash")
+    st.plotly_chart(fig_occ, use_container_width=True)
 
-    st.subheader("Q1 Coefficient Plot")
-    q1_plot = q1_results.copy()
-    q1_plot["ci_low"] = q1_plot["coefficient"] - 1.96 * q1_plot["std_error"]
-    q1_plot["ci_high"] = q1_plot["coefficient"] + 1.96 * q1_plot["std_error"]
-    q1_plot["label"] = q1_plot["model"] + " | " + q1_plot["term_label"]
-
-    fig_q1_coef = go.Figure()
-    fig_q1_coef.add_trace(go.Scatter(
-        x=q1_plot["coefficient"],
-        y=q1_plot["label"],
-        mode="markers",
-        error_x=dict(
-            type="data",
-            symmetric=False,
-            array=q1_plot["ci_high"] - q1_plot["coefficient"],
-            arrayminus=q1_plot["coefficient"] - q1_plot["ci_low"]
+    st.subheader("Q1 Model Output")
+    if len(q1_results) > 0:
+        st.dataframe(
+            q1_results[["model", "model_desc", "term_label", "coefficient", "std_error", "p_value", "nobs", "r_squared"]],
+            use_container_width=True
         )
-    ))
-    fig_q1_coef.add_vline(x=0, line_dash="dash")
-    fig_q1_coef.update_layout(
-        title="Q1 Key Coefficients with 95% Confidence Intervals",
-        xaxis_title="Coefficient",
-        yaxis_title=""
-    )
-    st.plotly_chart(fig_q1_coef, use_container_width=True)
-
-    st.info(
-        "Interpretation: A negative and statistically significant female coefficient across specifications indicates a persistent gender wage gap after controlling for education, tenure, hours, race, region, marital status, occupation, industry, and year."
-    )
 
 # -----------------------------
-# Q2 Prior Salary and Ban
+# Page: Q2
 # -----------------------------
-with tab2:
+elif page == "Q2 Prior Salary and Ban":
     st.subheader("Question 2")
     st.markdown("**Is there evidence that asking about prior salary negatively impacts female employees? Should a similar ban be implemented nationally?**")
 
     q2_results = results_table[results_table["question"] == "Q2"].copy()
 
-    q2_main = q2_results[(q2_results["model"] == "M4") & (q2_results["term"] == "ln_prior_wage")]
-    q2_inter = q2_results[(q2_results["model"] == "M5") & (q2_results["term"] == "ln_prior_wage:female")]
+    q2_main = q2_results[(q2_results["model"] == "M_Q2") & (q2_results["term"] == "ln_prior_wage")]
+    q2_inter = q2_results[(q2_results["model"] == "M_Q2_INT") & (q2_results["term"] == "ln_prior_wage:female")]
 
     if not q2_main.empty:
         coef = q2_main.iloc[0]["coefficient"]
         st.success(
-            f"Main prior-pay finding: log prior wage coefficient = {coef:.4f}. Current wages remain strongly anchored to prior wages."
+            f"Interactive answer: log prior wage coefficient = {coef:.4f}. Current wages remain strongly related to prior wages."
         )
 
     if not q2_inter.empty:
         coef = q2_inter.iloc[0]["coefficient"]
         p_val = q2_inter.iloc[0]["p_value"]
         st.warning(
-            f"Interaction result: prior wage × female = {coef:.4f}, p-value = {p_val:.4g}. This suggests limited evidence that the slope itself differs strongly by gender in the full interaction model."
+            f"Gender interaction: prior wage × female = {coef:.4f}, p-value = {p_val:.4g}. The slope difference is limited in this approximation."
         )
 
+    st.info(
+        "Interpretation: Women can still be disadvantaged when current pay is highly anchored to prior pay, even if the interaction term is not strongly different by gender."
+    )
+
     st.subheader("Prior Wage vs Current Wage")
-    st.write(f"Lag sample size: {len(lag_filtered):,}")
-
-    plot_lag = lag_filtered[
-        (lag_filtered["HRLY_WAGE"] <= lag_filtered["HRLY_WAGE"].quantile(0.99)) &
-        (lag_filtered["prior_wage"] <= lag_filtered["prior_wage"].quantile(0.99))
-    ].copy()
-
-    if len(plot_lag) > 8000:
-        plot_lag = plot_lag.sample(8000, random_state=42)
+    plot_lag = lag_filtered.copy()
+    if len(plot_lag) > 0:
+        plot_lag = plot_lag[
+            (plot_lag["HRLY_WAGE"] <= plot_lag["HRLY_WAGE"].quantile(0.99)) &
+            (plot_lag["prior_wage"] <= plot_lag["prior_wage"].quantile(0.99))
+        ].copy()
+        plot_lag = maybe_sample_for_scatter(plot_lag, max_rows=MAX_SCATTER_POINTS)
 
     fig_scatter = px.scatter(
         plot_lag,
@@ -902,81 +939,74 @@ with tab2:
         corr_value = lag_filtered[["prior_wage", "HRLY_WAGE"]].corr().iloc[0, 1]
         st.metric("Correlation: prior wage vs current wage", f"{corr_value:.3f}")
 
-    st.subheader("Q2 Regression Results")
-    st.dataframe(
-        q2_results[["model", "model_desc", "term_label", "coefficient", "std_error", "p_value", "nobs", "r_squared"]],
-        use_container_width=True
-    )
-
-    st.info(
-        "Policy interpretation: The dashboard supports the concern that reliance on prior wage can carry existing wage disparities into future pay. This supports the rationale for salary-history restrictions, while remaining careful not to overstate strict causality."
-    )
+    st.subheader("Q2 Model Output")
+    if len(q2_results) > 0:
+        st.dataframe(
+            q2_results[["model", "model_desc", "term_label", "coefficient", "std_error", "p_value", "nobs", "r_squared"]],
+            use_container_width=True
+        )
 
 # -----------------------------
-# Q3 Post-2018 Policy
+# Page: Q3
 # -----------------------------
-with tab3:
+elif page == "Q3 Post-2018 Policy":
     st.subheader("Question 3")
     st.markdown("**Would the prior-pay and current-pay relationship weaken after the California law? Would it become zero?**")
 
     q3_results = results_table[results_table["question"] == "Q3"].copy()
 
-    q3_main = q3_results[(q3_results["model"] == "M6") & (q3_results["term"] == "ln_prior_wage:post_2018")]
-    q3_triple = q3_results[(q3_results["model"] == "M8") & (q3_results["term"] == "ln_prior_wage:female:post_2018")]
+    q3_main = q3_results[(q3_results["model"] == "M_Q3") & (q3_results["term"] == "ln_prior_wage:post_2018")]
+    q3_triple = q3_results[(q3_results["model"] == "M_Q3_TRIPLE") & (q3_results["term"] == "ln_prior_wage:female:post_2018")]
 
     if not q3_main.empty:
         coef = q3_main.iloc[0]["coefficient"]
         p_val = q3_main.iloc[0]["p_value"]
-        st.success(
-            f"Post-2018 interaction: log prior wage × post-2018 = {coef:.4f}, p-value = {p_val:.4g}."
-        )
+        st.success(f"Interactive answer: log prior wage × post-2018 = {coef:.4f}, p-value = {p_val:.4g}.")
 
     if not q3_triple.empty:
         coef = q3_triple.iloc[0]["coefficient"]
         p_val = q3_triple.iloc[0]["p_value"]
-        st.warning(
-            f"Triple interaction: log prior wage × female × post-2018 = {coef:.4f}, p-value = {p_val:.4g}."
-        )
-
-    q3_plot = q3_results.copy()
-    q3_plot["ci_low"] = q3_plot["coefficient"] - 1.96 * q3_plot["std_error"]
-    q3_plot["ci_high"] = q3_plot["coefficient"] + 1.96 * q3_plot["std_error"]
-    q3_plot["label"] = q3_plot["model"] + " | " + q3_plot["term_label"]
-
-    fig_q3_coef = go.Figure()
-    fig_q3_coef.add_trace(go.Scatter(
-        x=q3_plot["coefficient"],
-        y=q3_plot["label"],
-        mode="markers",
-        error_x=dict(
-            type="data",
-            symmetric=False,
-            array=q3_plot["ci_high"] - q3_plot["coefficient"],
-            arrayminus=q3_plot["coefficient"] - q3_plot["ci_low"]
-        )
-    ))
-    fig_q3_coef.add_vline(x=0, line_dash="dash")
-    fig_q3_coef.update_layout(
-        title="Q3 Key Coefficients with 95% Confidence Intervals",
-        xaxis_title="Coefficient",
-        yaxis_title=""
-    )
-    st.plotly_chart(fig_q3_coef, use_container_width=True)
-
-    st.subheader("Q3 Regression Results")
-    st.dataframe(
-        q3_results[["model", "model_desc", "term_label", "coefficient", "std_error", "p_value", "nobs", "r_squared"]],
-        use_container_width=True
-    )
+        st.warning(f"Triple interaction: log prior wage × female × post-2018 = {coef:.4f}, p-value = {p_val:.4g}.")
 
     st.info(
-        "Interpretation: Even if salary-history restrictions weaken direct employer reliance on past wages, the relationship between prior and current pay is not expected to become zero because prior wages also reflect accumulated experience, occupation trajectory, and labor-market sorting."
+        "Interpretation: The relationship between prior and current pay does not mechanically fall to zero after policy changes because prior pay also captures experience, job trajectory, and labor-market sorting."
     )
 
+    if len(q3_results) > 0:
+        q3_plot = q3_results.copy()
+        q3_plot["ci_low"] = q3_plot["coefficient"] - 1.96 * q3_plot["std_error"]
+        q3_plot["ci_high"] = q3_plot["coefficient"] + 1.96 * q3_plot["std_error"]
+        q3_plot["label"] = q3_plot["model"] + " | " + q3_plot["term_label"]
+
+        fig_q3_coef = go.Figure()
+        fig_q3_coef.add_trace(go.Scatter(
+            x=q3_plot["coefficient"],
+            y=q3_plot["label"],
+            mode="markers",
+            error_x=dict(
+                type="data",
+                symmetric=False,
+                array=q3_plot["ci_high"] - q3_plot["coefficient"],
+                arrayminus=q3_plot["coefficient"] - q3_plot["ci_low"]
+            )
+        ))
+        fig_q3_coef.add_vline(x=0, line_dash="dash")
+        fig_q3_coef.update_layout(
+            title="Q3 Key Coefficients with 95% Confidence Intervals",
+            xaxis_title="Coefficient",
+            yaxis_title=""
+        )
+        st.plotly_chart(fig_q3_coef, use_container_width=True)
+
+        st.dataframe(
+            q3_results[["model", "model_desc", "term_label", "coefficient", "std_error", "p_value", "nobs", "r_squared"]],
+            use_container_width=True
+        )
+
 # -----------------------------
-# Q4 Hidden Factors and Limits
+# Page: Q4
 # -----------------------------
-with tab4:
+elif page == "Q4 Hidden Factors and Limits":
     st.subheader("Question 4")
     st.markdown("**Are there hidden or latent factors influencing the observed differences?**")
 
@@ -995,12 +1025,11 @@ with tab4:
     - Selection into employment
     """)
 
-    col_c, col_d = st.columns(2)
+    c, d = st.columns(2)
 
-    with col_c:
+    with c:
         occ_plot = occupation_pivot.dropna(subset=["female_to_male_ratio"]).copy()
         occ_plot = occ_plot.sort_values("female_to_male_ratio").head(15)
-
         fig_occ = px.bar(
             occ_plot,
             x="female_to_male_ratio",
@@ -1011,10 +1040,9 @@ with tab4:
         fig_occ.add_vline(x=1.0, line_dash="dash")
         st.plotly_chart(fig_occ, use_container_width=True)
 
-    with col_d:
+    with d:
         ind_plot = industry_pivot.dropna(subset=["female_to_male_ratio"]).copy()
         ind_plot = ind_plot.sort_values("female_to_male_ratio").head(15)
-
         fig_ind = px.bar(
             ind_plot,
             x="female_to_male_ratio",
@@ -1026,17 +1054,15 @@ with tab4:
         st.plotly_chart(fig_ind, use_container_width=True)
 
     st.warning(
-        "Limitation note: The dataset does not directly observe whether employers explicitly asked for salary history. The results therefore support the policy rationale and association patterns, but they do not by themselves provide strict causal identification of employer behavior."
+        "Limitation note: The dataset does not directly observe whether employers explicitly asked for salary history. The dashboard therefore supports policy rationale and association patterns rather than strict causal identification."
     )
 
 # -----------------------------
-# AI Wage Simulator
+# Page: Simulator
 # -----------------------------
-with tab5:
+elif page == "AI Wage Simulator":
     st.subheader("AI-Style Wage Projection Simulator")
-    st.markdown("Use the controls below to simulate projected wages, compare models, and connect the predictions back to Q1-Q4.")
-
-    sim_col1, sim_col2, sim_col3 = st.columns(3)
+    st.markdown("Choose a profile, then generate projected wages, same-profile gender comparisons, and policy comparisons.")
 
     year_min_allowed = int(df["Year"].min()) if "Year" in df.columns and df["Year"].notna().any() else 1997
     year_max_allowed = int(df["Year"].max()) + 10 if "Year" in df.columns and df["Year"].notna().any() else 2031
@@ -1054,156 +1080,151 @@ with tab5:
     region_choices = sorted(df["region_label"].dropna().unique().tolist())
     marital_choices = sorted(df["marital_status"].dropna().unique().tolist())
 
-    with sim_col1:
-        sim_year = st.number_input(
-            "Base year",
-            min_value=year_min_allowed,
-            max_value=year_max_allowed,
-            value=int(clamp(default_year, year_min_allowed, year_max_allowed)),
-            step=1
-        )
-        sim_sex = st.selectbox("Gender", ["Male", "Female"], index=1)
-        sim_race = st.selectbox("Race", race_choices, index=0 if len(race_choices) > 0 else None)
-        sim_region = st.selectbox("Region", region_choices, index=0 if len(region_choices) > 0 else None)
+    with st.form("simulator_form"):
+        f1, f2, f3 = st.columns(3)
 
-    with sim_col2:
-        sim_marital = st.selectbox("Marital status code", marital_choices, index=0 if len(marital_choices) > 0 else None)
-        sim_age = st.number_input("Age", min_value=18, max_value=70, value=int(clamp(default_age, 18, 70)), step=1)
-        sim_hgc = st.number_input("Education (HGC)", min_value=0.0, max_value=25.0, value=float(clamp(default_hgc, 0.0, 25.0)), step=0.5)
-        sim_tenure = st.number_input("Tenure", min_value=0.0, max_value=40.0, value=float(clamp(default_tenure, 0.0, 40.0)), step=0.5)
-
-    with sim_col3:
-        sim_hours = st.number_input("Weekly hours worked", min_value=1.0, max_value=120.0, value=float(clamp(default_hours, 1.0, 120.0)), step=1.0)
-        sim_prior_wage = st.number_input("Prior wage", min_value=0.5, max_value=500.0, value=float(clamp(default_prior_wage, 0.5, 500.0)), step=0.5)
-        sim_occ = st.selectbox("Occupation group", occ_choices, index=0 if len(occ_choices) > 0 else None)
-        sim_ind = st.selectbox("Industry group", ind_choices, index=0 if len(ind_choices) > 0 else None)
-
-    forecast_model_choice = st.selectbox(
-        "Projection model",
-        [
-            "Q1 Full Controls Forecast Model",
-            "Q2 Prior Wage Forecast Model",
-            "Q3 Policy Forecast Model"
-        ],
-        index=1
-    )
-
-    horizon_set = st.multiselect("Projection horizons", [0, 1, 3, 5], default=[0, 1, 3, 5])
-
-    base_inputs = {
-        "year_value": int(sim_year),
-        "sex_label": sim_sex,
-        "race_label": sim_race,
-        "region_label": sim_region,
-        "marital_status": sim_marital,
-        "age": float(sim_age),
-        "hgc": float(sim_hgc),
-        "tenure": float(sim_tenure),
-        "hrs_wrk": float(sim_hours),
-        "occupation_group": sim_occ,
-        "industry_group": sim_ind,
-        "prior_wage": float(sim_prior_wage)
-    }
-
-    forecast_model_map = {
-        "Q1 Full Controls Forecast Model": models.get("F_Q1"),
-        "Q2 Prior Wage Forecast Model": models.get("F_Q2"),
-        "Q3 Policy Forecast Model": models.get("F_Q3")
-    }
-
-    selected_forecast_model = forecast_model_map.get(forecast_model_choice)
-
-    if selected_forecast_model is not None and len(horizon_set) > 0:
-        pred_path = predict_wage_path(selected_forecast_model, sorted(horizon_set), base_inputs)
-
-        p1, p2, p3, p4 = st.columns(4)
-        if 0 in pred_path["horizon_years"].values:
-            p1.metric(
-                "Predicted wage now",
-                f"{pred_path.loc[pred_path['horizon_years'] == 0, 'predicted_wage'].iloc[0]:.2f}"
+        with f1:
+            sim_year = st.number_input(
+                "Base year",
+                min_value=year_min_allowed,
+                max_value=year_max_allowed,
+                value=int(clamp(default_year, year_min_allowed, year_max_allowed)),
+                step=1
             )
-        if 1 in pred_path["horizon_years"].values:
-            p2.metric(
-                "Predicted wage in 1 year",
-                f"{pred_path.loc[pred_path['horizon_years'] == 1, 'predicted_wage'].iloc[0]:.2f}"
+            sim_sex = st.selectbox("Gender", ["Male", "Female"], index=1)
+            sim_race = st.selectbox("Race", race_choices, index=0 if len(race_choices) > 0 else 0)
+            sim_region = st.selectbox("Region", region_choices, index=0 if len(region_choices) > 0 else 0)
+
+        with f2:
+            sim_marital = st.selectbox("Marital status code", marital_choices, index=0 if len(marital_choices) > 0 else 0)
+            sim_age = st.number_input("Age", min_value=18, max_value=70, value=int(clamp(default_age, 18, 70)), step=1)
+            sim_hgc = st.number_input("Education (HGC)", min_value=0.0, max_value=25.0, value=float(clamp(default_hgc, 0.0, 25.0)), step=0.5)
+            sim_tenure = st.number_input("Tenure", min_value=0.0, max_value=40.0, value=float(clamp(default_tenure, 0.0, 40.0)), step=0.5)
+
+        with f3:
+            sim_hours = st.number_input("Weekly hours worked", min_value=1.0, max_value=120.0, value=float(clamp(default_hours, 1.0, 120.0)), step=1.0)
+            sim_prior_wage = st.number_input("Prior wage", min_value=0.5, max_value=500.0, value=float(clamp(default_prior_wage, 0.5, 500.0)), step=0.5)
+            sim_occ = st.selectbox("Occupation group", occ_choices, index=0 if len(occ_choices) > 0 else 0)
+            sim_ind = st.selectbox("Industry group", ind_choices, index=0 if len(ind_choices) > 0 else 0)
+
+        forecast_model_choice = st.selectbox(
+            "Projection model",
+            ["Baseline wage model", "Prior wage model", "Policy interaction model"],
+            index=1
+        )
+
+        horizon_set = st.multiselect("Projection horizons", [0, 1, 3, 5], default=[0, 1, 3, 5])
+
+        submitted = st.form_submit_button("Generate prediction")
+
+    if submitted:
+        base_inputs = {
+            "year_value": int(sim_year),
+            "sex_label": sim_sex,
+            "race_label": sim_race,
+            "region_label": sim_region,
+            "marital_status": sim_marital,
+            "age": float(sim_age),
+            "hgc": float(sim_hgc),
+            "tenure": float(sim_tenure),
+            "hrs_wrk": float(sim_hours),
+            "occupation_group": sim_occ,
+            "industry_group": sim_ind,
+            "prior_wage": float(sim_prior_wage)
+        }
+
+        model_map = {
+            "Baseline wage model": models.get("F_BASE"),
+            "Prior wage model": models.get("F_PRIOR"),
+            "Policy interaction model": models.get("F_POLICY")
+        }
+        selected_model = model_map.get(forecast_model_choice)
+
+        pred_path = predict_wage_path(selected_model, sorted(horizon_set), base_inputs)
+
+        if len(pred_path) == 0:
+            st.error("Prediction could not be generated.")
+        else:
+            p1, p2, p3, p4 = st.columns(4)
+            if 0 in pred_path["horizon_years"].values:
+                p1.metric("Predicted wage now", f"{pred_path.loc[pred_path['horizon_years'] == 0, 'predicted_wage'].iloc[0]:.2f}")
+            if 1 in pred_path["horizon_years"].values:
+                p2.metric("Predicted wage in 1 year", f"{pred_path.loc[pred_path['horizon_years'] == 1, 'predicted_wage'].iloc[0]:.2f}")
+            if 3 in pred_path["horizon_years"].values:
+                p3.metric("Predicted wage in 3 years", f"{pred_path.loc[pred_path['horizon_years'] == 3, 'predicted_wage'].iloc[0]:.2f}")
+            if 5 in pred_path["horizon_years"].values:
+                p4.metric("Predicted wage in 5 years", f"{pred_path.loc[pred_path['horizon_years'] == 5, 'predicted_wage'].iloc[0]:.2f}")
+
+            fig_pred = px.line(
+                pred_path,
+                x="projected_year",
+                y="predicted_wage",
+                markers=True,
+                title="Projected Wage Path"
             )
-        if 3 in pred_path["horizon_years"].values:
-            p3.metric(
-                "Predicted wage in 3 years",
-                f"{pred_path.loc[pred_path['horizon_years'] == 3, 'predicted_wage'].iloc[0]:.2f}"
+            st.plotly_chart(fig_pred, use_container_width=True)
+
+            st.subheader("Same Profile, Different Gender")
+            gender_compare = same_profile_gender_comparison(models.get("F_BASE"), base_inputs)
+            if len(gender_compare) > 0:
+                fig_gender = px.bar(
+                    gender_compare,
+                    x="sex_label",
+                    y="predicted_wage",
+                    color="sex_label",
+                    title="Predicted Wage Under the Same Observed Profile"
+                )
+                st.plotly_chart(fig_gender, use_container_width=True)
+
+            st.subheader("With vs Without Prior Wage Information")
+            prior_compare = prior_wage_policy_comparison(models.get("F_PRIOR"), models.get("F_BASE"), base_inputs)
+            if len(prior_compare) > 0:
+                fig_prior = px.bar(
+                    prior_compare,
+                    x="scenario",
+                    y="predicted_wage",
+                    color="scenario",
+                    title="Predicted Wage Under Alternative Prior-Wage Information Regimes"
+                )
+                st.plotly_chart(fig_prior, use_container_width=True)
+
+            st.subheader("Pre-2018 vs Post-2018 Policy Proxy")
+            policy_compare = pre_post_policy_comparison(models.get("F_POLICY"), base_inputs)
+            if len(policy_compare) > 0:
+                fig_policy = px.bar(
+                    policy_compare,
+                    x="policy_period",
+                    y="predicted_wage",
+                    color="policy_period",
+                    title="Predicted Wage Under Pre-2018 and Post-2018 Proxies"
+                )
+                st.plotly_chart(fig_policy, use_container_width=True)
+
+            st.subheader("Model Comparison")
+            compare_df = compare_model_predictions(models, base_inputs)
+            if len(compare_df) > 0:
+                st.dataframe(compare_df, use_container_width=True)
+
+            st.info(
+                "How to read the simulator: baseline compares same-profile male and female predictions. Prior wage comparison shows how salary-history reliance can preserve wage differences. Policy comparison shows that the prior-pay relationship does not automatically fall to zero."
             )
-        if 5 in pred_path["horizon_years"].values:
-            p4.metric(
-                "Predicted wage in 5 years",
-                f"{pred_path.loc[pred_path['horizon_years'] == 5, 'predicted_wage'].iloc[0]:.2f}"
+
+            st.warning(
+                "Uncertainty note: These are model-based scenario forecasts, not guaranteed future outcomes. They rely on observed variables only and do not include unobserved productivity, caregiving burden, negotiation dynamics, employer pay-setting differences, or future labor-market shocks."
             )
-
-        fig_pred = px.line(
-            pred_path,
-            x="projected_year",
-            y="predicted_wage",
-            markers=True,
-            title="Projected Wage Path"
-        )
-        st.plotly_chart(fig_pred, use_container_width=True)
-
-        st.subheader("Same Profile, Different Gender")
-        gender_compare = same_profile_gender_comparison(models.get("F_Q1"), base_inputs)
-        fig_gender = px.bar(
-            gender_compare,
-            x="sex_label",
-            y="predicted_wage",
-            color="sex_label",
-            title="Predicted Wage Under the Same Observed Profile"
-        )
-        st.plotly_chart(fig_gender, use_container_width=True)
-
-        st.subheader("With vs Without Prior Wage Information")
-        prior_compare = prior_wage_policy_comparison(models.get("F_Q2"), models.get("F_Q1"), base_inputs)
-        fig_prior = px.bar(
-            prior_compare,
-            x="scenario",
-            y="predicted_wage",
-            color="scenario",
-            title="Predicted Wage Under Alternative Prior-Wage Information Regimes"
-        )
-        st.plotly_chart(fig_prior, use_container_width=True)
-
-        st.subheader("Pre-2018 vs Post-2018 Policy Proxy")
-        policy_compare = pre_post_policy_comparison(models.get("F_Q3"), base_inputs)
-        fig_policy = px.bar(
-            policy_compare,
-            x="policy_period",
-            y="predicted_wage",
-            color="policy_period",
-            title="Predicted Wage Under Pre-2018 and Post-2018 Proxies"
-        )
-        st.plotly_chart(fig_policy, use_container_width=True)
-
-        st.subheader("Model Comparison")
-        compare_df = compare_model_predictions(models, base_inputs)
-        st.dataframe(compare_df, use_container_width=True)
-
-        st.info(
-            "How to read this simulator: Q1 compares same-profile male and female predictions. Q2 compares scenarios with and without prior wage information. Q3 compares pre-2018 and post-2018 policy proxies. Q4 is reflected in the uncertainty and omitted-factor caveat below."
-        )
-
-        st.warning(
-            "Uncertainty note: These projections are model-based scenario forecasts, not guaranteed future outcomes. They rely on observed variables and do not include unobserved productivity, caregiving burden, negotiation dynamics, employer pay-setting differences, or future labor market shocks."
-        )
 
 # -----------------------------
-# Data Preview
+# Page: Data preview
 # -----------------------------
-with tab6:
+elif page == "Data Preview":
     st.subheader("Raw Data Preview")
-    st.dataframe(df_raw.head(100), use_container_width=True)
+    st.dataframe(df_raw.head(MAX_PREVIEW_ROWS), use_container_width=True)
 
-    st.subheader("Cleaned Data Preview")
-    st.dataframe(filtered.head(100), use_container_width=True)
+    st.subheader("Cleaned Main Sample Preview")
+    st.dataframe(filtered.head(MAX_PREVIEW_ROWS), use_container_width=True)
 
     st.subheader("Lag Sample Preview")
-    st.dataframe(lag_filtered.head(100), use_container_width=True)
+    st.dataframe(lag_filtered.head(MAX_PREVIEW_ROWS), use_container_width=True)
 
     st.subheader("Column Names")
     st.write(df_raw.columns.tolist())
