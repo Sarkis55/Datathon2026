@@ -1026,12 +1026,17 @@ with tab5:
 
     sim_col1, sim_col2, sim_col3 = st.columns(3)
 
-    default_year = int(df["Year"].max()) if "Year" in df.columns else 2021
-    default_age = int(np.nanmedian(df["age"])) if "age" in df.columns and df["age"].notna().any() else 30
-    default_hgc = float(np.nanmedian(df["HGC"])) if "HGC" in df.columns and df["HGC"].notna().any() else 16.0
-    default_tenure = float(np.nanmedian(df["TENURE"])) if "TENURE" in df.columns and df["TENURE"].notna().any() else 2.0
-    default_hours = float(np.nanmedian(df["HRS_WRK"])) if "HRS_WRK" in df.columns and df["HRS_WRK"].notna().any() else 40.0
-    default_prior_wage = float(np.nanmedian(df_lag["prior_wage"])) if len(df_lag) > 0 else 25.0
+def clamp(value, min_value, max_value):
+    if pd.isna(value):
+        return min_value
+    return max(min_value, min(float(value), max_value))
+
+default_year = int(df["Year"].max()) if "Year" in df.columns else 2021
+default_age = int(clamp(np.nanmedian(df["age"]) if "age" in df.columns and df["age"].notna().any() else 30, 18, 70))
+default_hgc = float(clamp(np.nanmedian(df["HGC"]) if "HGC" in df.columns and df["HGC"].notna().any() else 16.0, 0.0, 25.0))
+default_tenure = float(clamp(np.nanmedian(df["TENURE"]) if "TENURE" in df.columns and df["TENURE"].notna().any() else 2.0, 0.0, 40.0))
+default_hours = float(clamp(np.nanmedian(df["HRS_WRK"]) if "HRS_WRK" in df.columns and df["HRS_WRK"].notna().any() else 40.0, 1.0, 120.0))
+default_prior_wage = float(clamp(np.nanmedian(df_lag["prior_wage"]) if len(df_lag) > 0 else 25.0, 0.5, 500.0))
 
     occ_choices = sorted(df["Occupation_Group2"].dropna().unique().tolist())
     ind_choices = sorted(df["Industry_Group"].dropna().unique().tolist())
