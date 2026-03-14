@@ -1,8 +1,8 @@
-streamlit==1.43.2
-pandas==2.2.3
-numpy==1.26.4
-requests==2.32.3
-plotly==5.24.1
-statsmodels==0.14.4
-scipy==1.13.1
-patsy==0.5.6
+streamlit
+pandas
+numpy
+requests
+plotly
+statsmodels
+scipy
+patsy
