@@ -33,8 +33,18 @@ st.set_page_config(
 ZIP_URL = "https://raw.githubusercontent.com/Sarkis55/Datathon2026/main/graduate-full.csv.zip"
 
 # -----------------------------
-# Helpers
+# Utility helpers
 # -----------------------------
+def clamp(value, min_value, max_value):
+    if value is None:
+        return min_value
+    try:
+        if pd.isna(value):
+            return min_value
+    except Exception:
+        pass
+    return max(min_value, min(float(value), max_value))
+
 def safe_exp_pct(beta):
     if pd.isna(beta):
         return np.nan
@@ -63,6 +73,9 @@ def human_term(term):
     }
     return mapping.get(term, term)
 
+# -----------------------------
+# Data loading
+# -----------------------------
 @st.cache_data(show_spinner=True)
 def load_data_from_github_zip(zip_url: str) -> pd.DataFrame:
     response = requests.get(zip_url, timeout=180)
@@ -100,14 +113,12 @@ def preprocess_data(df_raw: pd.DataFrame):
         if col in df.columns:
             df[col] = pd.to_datetime(df[col], errors="coerce")
 
-    # Core cleaning
     if "Employed" in df.columns:
         df = df[df["Employed"] == 1].copy()
 
     df = df[df["HRLY_WAGE"].notna()].copy()
     df = df[df["HRLY_WAGE"] > 0].copy()
 
-    # Trim extreme wages
     wage_low = df["HRLY_WAGE"].quantile(0.01)
     wage_high = df["HRLY_WAGE"].quantile(0.99)
     df = df[(df["HRLY_WAGE"] >= wage_low) & (df["HRLY_WAGE"] <= wage_high)].copy()
@@ -118,7 +129,6 @@ def preprocess_data(df_raw: pd.DataFrame):
     if "TENURE" in df.columns:
         df = df[(df["TENURE"].isna()) | (df["TENURE"] >= 0)].copy()
 
-    # Feature engineering
     if "SAMPLE_SEX_1997" in df.columns:
         df["female"] = np.where(df["SAMPLE_SEX_1997"] == 2, 1, 0)
         sex_map = {1: "Male", 2: "Female"}
@@ -158,7 +168,6 @@ def preprocess_data(df_raw: pd.DataFrame):
     else:
         df["region_label"] = "Unknown"
 
-    # Keep string categories stable
     for col in ["Occupation_Group2", "Industry_Group"]:
         if col not in df.columns:
             df[col] = "Unknown"
@@ -172,7 +181,6 @@ def preprocess_data(df_raw: pd.DataFrame):
     df["Year_num"] = df["Year"] if "Year" in df.columns else np.nan
     df["post_2018"] = np.where(df["Year_num"] >= 2018, 1, 0)
 
-    # Sort and build prior wage
     sort_cols = []
     if "PUBID_1997" in df.columns:
         sort_cols.append("PUBID_1997")
@@ -235,6 +243,9 @@ def preprocess_data(df_raw: pd.DataFrame):
 
     return df, df_lag, year_gender, occupation_pivot, industry_pivot
 
+# -----------------------------
+# Modeling
+# -----------------------------
 def fit_ols(formula, data):
     try:
         model = smf.ols(formula=formula, data=data).fit(cov_type="HC3")
@@ -246,7 +257,6 @@ def fit_ols(formula, data):
 def fit_models(df, df_lag):
     models = {}
 
-    # Q1: fixed-effect style descriptive regression models
     models["M1"] = fit_ols(
         """
         ln_wage ~ female + age + age_sq + HGC + TENURE + HRS_WRK
@@ -272,7 +282,6 @@ def fit_models(df, df_lag):
         df
     )
 
-    # Q2 / Q3
     models["M4"] = fit_ols(
         """
         ln_wage ~ ln_prior_wage + female + age + age_sq + HGC + TENURE + HRS_WRK
@@ -317,7 +326,6 @@ def fit_models(df, df_lag):
         df_lag
     )
 
-    # Forecast-friendly trend models for simulator
     models["F_Q1"] = fit_ols(
         """
         ln_wage ~ female + age + age_sq + HGC + TENURE + HRS_WRK + Year_num
@@ -400,6 +408,9 @@ def extract_model_table(models):
 
     return pd.DataFrame(rows)
 
+# -----------------------------
+# Filtering and summaries
+# -----------------------------
 def build_summary_cards(df_filtered):
     male_mean = df_filtered.loc[df_filtered["sex_label"] == "Male", "HRLY_WAGE"].mean()
     female_mean = df_filtered.loc[df_filtered["sex_label"] == "Female", "HRLY_WAGE"].mean()
@@ -462,6 +473,9 @@ def filter_lag_data(df_lag, year_range, selected_gender, selected_race, selected
     lag_filtered = lag_filtered[lag_filtered["region_label"].isin(selected_region)]
     return lag_filtered
 
+# -----------------------------
+# Simulator helpers
+# -----------------------------
 def build_profile_row(
     year_value,
     sex_label,
@@ -631,8 +645,6 @@ def prior_wage_policy_comparison(model_with_prior, model_without_prior, base_inp
         industry_group=base_inputs["industry_group"],
         prior_wage=max(base_inputs["prior_wage"], 1e-6)
     )
-
-    # For the no-prior-wage comparator, use Q1 forecast model
     pred_without = float(np.exp(model_without_prior.predict(row_without)[0]))
     rows.append({
         "scenario": "Without prior wage information",
@@ -669,7 +681,7 @@ def pre_post_policy_comparison(model_policy, base_inputs):
     return pd.DataFrame(rows)
 
 # -----------------------------
-# Load
+# Load data and models
 # -----------------------------
 st.title("Datathon 2026 Dashboard")
 st.caption("Gender pay gap, prior pay analysis, policy interpretation, and AI-style wage projection")
@@ -1026,17 +1038,15 @@ with tab5:
 
     sim_col1, sim_col2, sim_col3 = st.columns(3)
 
-def clamp(value, min_value, max_value):
-    if pd.isna(value):
-        return min_value
-    return max(min_value, min(float(value), max_value))
+    year_min_allowed = int(df["Year"].min()) if "Year" in df.columns and df["Year"].notna().any() else 1997
+    year_max_allowed = int(df["Year"].max()) + 10 if "Year" in df.columns and df["Year"].notna().any() else 2031
 
-default_year = int(df["Year"].max()) if "Year" in df.columns else 2021
-default_age = int(clamp(np.nanmedian(df["age"]) if "age" in df.columns and df["age"].notna().any() else 30, 18, 70))
-default_hgc = float(clamp(np.nanmedian(df["HGC"]) if "HGC" in df.columns and df["HGC"].notna().any() else 16.0, 0.0, 25.0))
-default_tenure = float(clamp(np.nanmedian(df["TENURE"]) if "TENURE" in df.columns and df["TENURE"].notna().any() else 2.0, 0.0, 40.0))
-default_hours = float(clamp(np.nanmedian(df["HRS_WRK"]) if "HRS_WRK" in df.columns and df["HRS_WRK"].notna().any() else 40.0, 1.0, 120.0))
-default_prior_wage = float(clamp(np.nanmedian(df_lag["prior_wage"]) if len(df_lag) > 0 else 25.0, 0.5, 500.0))
+    default_year = int(df["Year"].max()) if "Year" in df.columns and df["Year"].notna().any() else 2021
+    default_age = int(clamp(np.nanmedian(df["age"]) if "age" in df.columns and df["age"].notna().any() else 30, 18, 70))
+    default_hgc = float(clamp(np.nanmedian(df["HGC"]) if "HGC" in df.columns and df["HGC"].notna().any() else 16.0, 0.0, 25.0))
+    default_tenure = float(clamp(np.nanmedian(df["TENURE"]) if "TENURE" in df.columns and df["TENURE"].notna().any() else 2.0, 0.0, 40.0))
+    default_hours = float(clamp(np.nanmedian(df["HRS_WRK"]) if "HRS_WRK" in df.columns and df["HRS_WRK"].notna().any() else 40.0, 1.0, 120.0))
+    default_prior_wage = float(clamp(np.nanmedian(df_lag["prior_wage"]) if len(df_lag) > 0 else 25.0, 0.5, 500.0))
 
     occ_choices = sorted(df["Occupation_Group2"].dropna().unique().tolist())
     ind_choices = sorted(df["Industry_Group"].dropna().unique().tolist())
@@ -1045,22 +1055,28 @@ default_prior_wage = float(clamp(np.nanmedian(df_lag["prior_wage"]) if len(df_la
     marital_choices = sorted(df["marital_status"].dropna().unique().tolist())
 
     with sim_col1:
-        sim_year = st.number_input("Base year", min_value=int(df["Year"].min()), max_value=int(df["Year"].max()) + 10, value=default_year, step=1)
+        sim_year = st.number_input(
+            "Base year",
+            min_value=year_min_allowed,
+            max_value=year_max_allowed,
+            value=int(clamp(default_year, year_min_allowed, year_max_allowed)),
+            step=1
+        )
         sim_sex = st.selectbox("Gender", ["Male", "Female"], index=1)
-        sim_race = st.selectbox("Race", race_choices, index=0 if race_choices else None)
-        sim_region = st.selectbox("Region", region_choices, index=0 if region_choices else None)
+        sim_race = st.selectbox("Race", race_choices, index=0 if len(race_choices) > 0 else None)
+        sim_region = st.selectbox("Region", region_choices, index=0 if len(region_choices) > 0 else None)
 
     with sim_col2:
-        sim_marital = st.selectbox("Marital status code", marital_choices, index=0 if marital_choices else None)
-        sim_age = st.number_input("Age", min_value=18, max_value=70, value=int(default_age), step=1)
-        sim_hgc = st.number_input("Education (HGC)", min_value=0.0, max_value=25.0, value=float(default_hgc), step=0.5)
-        sim_tenure = st.number_input("Tenure", min_value=0.0, max_value=40.0, value=float(default_tenure), step=0.5)
+        sim_marital = st.selectbox("Marital status code", marital_choices, index=0 if len(marital_choices) > 0 else None)
+        sim_age = st.number_input("Age", min_value=18, max_value=70, value=int(clamp(default_age, 18, 70)), step=1)
+        sim_hgc = st.number_input("Education (HGC)", min_value=0.0, max_value=25.0, value=float(clamp(default_hgc, 0.0, 25.0)), step=0.5)
+        sim_tenure = st.number_input("Tenure", min_value=0.0, max_value=40.0, value=float(clamp(default_tenure, 0.0, 40.0)), step=0.5)
 
     with sim_col3:
-        sim_hours = st.number_input("Weekly hours worked", min_value=1.0, max_value=120.0, value=float(default_hours), step=1.0)
-        sim_prior_wage = st.number_input("Prior wage", min_value=0.5, max_value=500.0, value=float(default_prior_wage), step=0.5)
-        sim_occ = st.selectbox("Occupation group", occ_choices, index=0 if occ_choices else None)
-        sim_ind = st.selectbox("Industry group", ind_choices, index=0 if ind_choices else None)
+        sim_hours = st.number_input("Weekly hours worked", min_value=1.0, max_value=120.0, value=float(clamp(default_hours, 1.0, 120.0)), step=1.0)
+        sim_prior_wage = st.number_input("Prior wage", min_value=0.5, max_value=500.0, value=float(clamp(default_prior_wage, 0.5, 500.0)), step=0.5)
+        sim_occ = st.selectbox("Occupation group", occ_choices, index=0 if len(occ_choices) > 0 else None)
+        sim_ind = st.selectbox("Industry group", ind_choices, index=0 if len(ind_choices) > 0 else None)
 
     forecast_model_choice = st.selectbox(
         "Projection model",
