@@ -35,9 +35,10 @@ st.set_page_config(
 # -----------------------------
 ZIP_URL = "https://raw.githubusercontent.com/Sarkis55/Datathon2026/main/graduate-full.csv.zip"
 
-MAX_MODEL_ROWS_MAIN = 12000
-MAX_MODEL_ROWS_LAG = 10000
-MAX_SCATTER_POINTS = 6000
+# Reduced to fit Streamlit Cloud limits while keeping same functionality
+MAX_MODEL_ROWS_MAIN = 3500
+MAX_MODEL_ROWS_LAG = 3000
+MAX_SCATTER_POINTS = 2500
 MAX_PREVIEW_ROWS = 50
 
 # -----------------------------
@@ -68,9 +69,6 @@ def star_from_p(p):
     if p < 0.10:
         return "*"
     return ""
-
-def safe_first(seq, fallback):
-    return seq[0] if len(seq) > 0 else fallback
 
 def human_term(term):
     mapping = {
@@ -110,21 +108,32 @@ def safe_selectbox(label, options, default_index=0, key=None):
 # -----------------------------
 @st.cache_data(show_spinner=True)
 def load_data_from_github_zip(zip_url: str) -> pd.DataFrame:
-    headers = {"User-Agent": "Mozilla/5.0"}
-    response = requests.get(zip_url, timeout=180, headers=headers)
-    response.raise_for_status()
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Accept": "application/octet-stream"
+    }
 
-    zip_bytes = io.BytesIO(response.content)
+    last_error = None
+    for timeout_sec in [60, 120, 180]:
+        try:
+            response = requests.get(zip_url, timeout=timeout_sec, headers=headers)
+            response.raise_for_status()
 
-    with zipfile.ZipFile(zip_bytes, "r") as zf:
-        csv_names = [name for name in zf.namelist() if name.lower().endswith(".csv")]
-        if len(csv_names) == 0:
-            raise FileNotFoundError("No CSV file found inside the ZIP.")
-        csv_name = csv_names[0]
-        with zf.open(csv_name) as f:
-            df = pd.read_csv(f)
+            zip_bytes = io.BytesIO(response.content)
 
-    return df
+            with zipfile.ZipFile(zip_bytes, "r") as zf:
+                csv_names = [name for name in zf.namelist() if name.lower().endswith(".csv")]
+                if len(csv_names) == 0:
+                    raise FileNotFoundError("No CSV file found inside the ZIP.")
+                csv_name = csv_names[0]
+                with zf.open(csv_name) as f:
+                    df = pd.read_csv(f)
+
+            return df
+        except Exception as e:
+            last_error = e
+
+    raise RuntimeError(f"Failed to load ZIP from GitHub: {last_error}")
 
 # -----------------------------
 # Preprocessing
@@ -149,18 +158,15 @@ def preprocess_data(df_raw: pd.DataFrame):
         if col in df.columns:
             df[col] = pd.to_datetime(df[col], errors="coerce")
 
-    # Required wage column check
     if "HRLY_WAGE" not in df.columns:
         raise KeyError("Required column 'HRLY_WAGE' not found in dataset.")
 
-    # Core cleaning
     if "Employed" in df.columns:
         df = df[df["Employed"] == 1].copy()
 
     df = df[df["HRLY_WAGE"].notna()].copy()
     df = df[df["HRLY_WAGE"] > 0].copy()
 
-    # Trim extreme wages
     if len(df) > 0:
         wage_low = df["HRLY_WAGE"].quantile(0.01)
         wage_high = df["HRLY_WAGE"].quantile(0.99)
@@ -172,7 +178,6 @@ def preprocess_data(df_raw: pd.DataFrame):
     if "TENURE" in df.columns:
         df = df[(df["TENURE"].isna()) | (df["TENURE"] >= 0)].copy()
 
-    # Features
     if "SAMPLE_SEX_1997" in df.columns:
         df["female"] = np.where(df["SAMPLE_SEX_1997"] == 2, 1, 0)
         sex_map = {1: "Male", 2: "Female"}
@@ -232,7 +237,6 @@ def preprocess_data(df_raw: pd.DataFrame):
     df["Year_num"] = df["Year"] if "Year" in df.columns else np.nan
     df["post_2018"] = np.where(df["Year_num"] >= 2018, 1, 0)
 
-    # Sort and prior wage
     sort_cols = []
     if "PUBID_1997" in df.columns:
         sort_cols.append("PUBID_1997")
@@ -331,66 +335,88 @@ def fit_ols(formula, data):
 def fit_models(df, df_lag):
     """
     Cloud-safe model fitting:
-    - samples smaller subsets
-    - uses Year_num instead of year fixed effects
-    - keeps a small but meaningful model set
+    - smaller samples for Streamlit Cloud stability
+    - same model family and same app functionality
     """
     models = {}
 
     df_m = make_model_sample(df, MAX_MODEL_ROWS_MAIN, seed=42)
     df_lag_m = make_model_sample(df_lag, MAX_MODEL_ROWS_LAG, seed=42)
 
-    # Q1 full controls
-    models["M_Q1"] = fit_ols(
-        """
-        ln_wage ~ female + age + age_sq + HGC + TENURE + HRS_WRK + Year_num
-                + C(race_label) + C(region_label) + C(marital_status)
-                + C(Occupation_Group2) + C(Industry_Group)
-        """,
-        df_m
-    )
+    cat_cols = ["race_label", "region_label", "marital_status", "Occupation_Group2", "Industry_Group"]
+    for c in cat_cols:
+        if c in df_m.columns:
+            df_m[c] = df_m[c].astype("category")
+        if c in df_lag_m.columns:
+            df_lag_m[c] = df_lag_m[c].astype("category")
 
-    # Q2 prior wage
-    models["M_Q2"] = fit_ols(
-        """
-        ln_wage ~ ln_prior_wage + female + age + age_sq + HGC + TENURE + HRS_WRK + Year_num
-                + C(race_label) + C(region_label) + C(marital_status)
-                + C(Occupation_Group2) + C(Industry_Group)
-        """,
-        df_lag_m
-    )
+    q1_needed = [
+        "ln_wage", "female", "age", "age_sq", "HGC", "TENURE", "HRS_WRK", "Year_num",
+        "race_label", "region_label", "marital_status", "Occupation_Group2", "Industry_Group"
+    ]
+    q2_needed = q1_needed + ["ln_prior_wage"]
+    q3_needed = q2_needed + ["post_2018"]
 
-    # Q2 interaction
-    models["M_Q2_INT"] = fit_ols(
-        """
-        ln_wage ~ ln_prior_wage * female + age + age_sq + HGC + TENURE + HRS_WRK + Year_num
-                + C(race_label) + C(region_label) + C(marital_status)
-                + C(Occupation_Group2) + C(Industry_Group)
-        """,
-        df_lag_m
-    )
+    df_m_q1 = df_m.dropna(subset=[c for c in q1_needed if c in df_m.columns]).copy()
+    df_lag_q2 = df_lag_m.dropna(subset=[c for c in q2_needed if c in df_lag_m.columns]).copy()
+    df_lag_q3 = df_lag_m.dropna(subset=[c for c in q3_needed if c in df_lag_m.columns]).copy()
 
-    # Q3 policy
-    models["M_Q3"] = fit_ols(
-        """
-        ln_wage ~ ln_prior_wage * post_2018 + female + age + age_sq + HGC + TENURE + HRS_WRK + Year_num
-                + C(race_label) + C(region_label) + C(marital_status)
-                + C(Occupation_Group2) + C(Industry_Group)
-        """,
-        df_lag_m
-    )
+    if len(df_m_q1) < 200:
+        models["M_Q1"] = None
+    else:
+        models["M_Q1"] = fit_ols(
+            """
+            ln_wage ~ female + age + age_sq + HGC + TENURE + HRS_WRK + Year_num
+                    + C(race_label) + C(region_label) + C(marital_status)
+                    + C(Occupation_Group2) + C(Industry_Group)
+            """,
+            df_m_q1
+        )
 
-    # Q3 triple interaction
-    models["M_Q3_TRIPLE"] = fit_ols(
-        """
-        ln_wage ~ ln_prior_wage * female * post_2018 + age + age_sq + HGC + TENURE + HRS_WRK + Year_num
-                + C(race_label) + C(region_label) + C(marital_status)
-                + C(Occupation_Group2) + C(Industry_Group)
-        """,
-        df_lag_m
-    )
+    if len(df_lag_q2) < 200:
+        models["M_Q2"] = None
+        models["M_Q2_INT"] = None
+    else:
+        models["M_Q2"] = fit_ols(
+            """
+            ln_wage ~ ln_prior_wage + female + age + age_sq + HGC + TENURE + HRS_WRK + Year_num
+                    + C(race_label) + C(region_label) + C(marital_status)
+                    + C(Occupation_Group2) + C(Industry_Group)
+            """,
+            df_lag_q2
+        )
 
-    # Forecast models reused by simulator
+        models["M_Q2_INT"] = fit_ols(
+            """
+            ln_wage ~ ln_prior_wage * female + age + age_sq + HGC + TENURE + HRS_WRK + Year_num
+                    + C(race_label) + C(region_label) + C(marital_status)
+                    + C(Occupation_Group2) + C(Industry_Group)
+            """,
+            df_lag_q2
+        )
+
+    if len(df_lag_q3) < 200:
+        models["M_Q3"] = None
+        models["M_Q3_TRIPLE"] = None
+    else:
+        models["M_Q3"] = fit_ols(
+            """
+            ln_wage ~ ln_prior_wage * post_2018 + female + age + age_sq + HGC + TENURE + HRS_WRK + Year_num
+                    + C(race_label) + C(region_label) + C(marital_status)
+                    + C(Occupation_Group2) + C(Industry_Group)
+            """,
+            df_lag_q3
+        )
+
+        models["M_Q3_TRIPLE"] = fit_ols(
+            """
+            ln_wage ~ ln_prior_wage * female * post_2018 + age + age_sq + HGC + TENURE + HRS_WRK + Year_num
+                    + C(race_label) + C(region_label) + C(marital_status)
+                    + C(Occupation_Group2) + C(Industry_Group)
+            """,
+            df_lag_q3
+        )
+
     models["F_BASE"] = models["M_Q1"]
     models["F_PRIOR"] = models["M_Q2_INT"]
     models["F_POLICY"] = models["M_Q3_TRIPLE"]
@@ -781,14 +807,18 @@ st.title("Datathon 2026 Dashboard")
 st.caption("Gender pay gap, prior salary effects, policy interpretation, and user-facing wage prediction")
 
 try:
-    with st.spinner("Loading data, summaries, and cloud-safe models..."):
+    with st.spinner("Loading data and summaries..."):
         df_raw = load_data_from_github_zip(ZIP_URL)
         df, df_lag = preprocess_data(df_raw)
         year_gender, occupation_pivot, industry_pivot, prior_scatter = build_summaries(df, df_lag)
+
+    with st.spinner("Fitting cloud-safe models..."):
         models = fit_models(df, df_lag)
         results_table = extract_model_table(models)
+
 except Exception as e:
-    st.error(f"App failed during initialization: {e}")
+    st.error(f"App failed during initialization: {type(e).__name__}: {e}")
+    st.exception(e)
     st.stop()
 
 # -----------------------------
