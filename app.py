@@ -36,9 +36,9 @@ st.set_page_config(
 ZIP_URL = "https://raw.githubusercontent.com/Sarkis55/Datathon2026/main/graduate-full.csv.zip"
 
 # Reduced to fit Streamlit Cloud limits while keeping same functionality
-MAX_MODEL_ROWS_MAIN = 3500
-MAX_MODEL_ROWS_LAG = 3000
-MAX_SCATTER_POINTS = 2500
+MAX_MODEL_ROWS_MAIN = 1000
+MAX_MODEL_ROWS_LAG = 1000
+MAX_SCATTER_POINTS = 1500
 MAX_PREVIEW_ROWS = 50
 
 # -----------------------------
