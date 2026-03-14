@@ -35,10 +35,9 @@ st.set_page_config(
 # -----------------------------
 ZIP_URL = "https://raw.githubusercontent.com/Sarkis55/Datathon2026/main/graduate-full.csv.zip"
 
-# Reduced to fit Streamlit Cloud limits while keeping same functionality
-MAX_MODEL_ROWS_MAIN = 1000
-MAX_MODEL_ROWS_LAG = 1000
-MAX_SCATTER_POINTS = 1500
+MAX_MODEL_ROWS_MAIN = 3500
+MAX_MODEL_ROWS_LAG = 3000
+MAX_SCATTER_POINTS = 2500
 MAX_PREVIEW_ROWS = 50
 
 # -----------------------------
@@ -333,11 +332,6 @@ def fit_ols(formula, data):
 
 @st.cache_resource(show_spinner=True)
 def fit_models(df, df_lag):
-    """
-    Cloud-safe model fitting:
-    - smaller samples for Streamlit Cloud stability
-    - same model family and same app functionality
-    """
     models = {}
 
     df_m = make_model_sample(df, MAX_MODEL_ROWS_MAIN, seed=42)
@@ -905,12 +899,12 @@ if page == "Overview":
                 markers=True,
                 title="Average Hourly Wage by Gender Over Time"
             )
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="stretch")
 
     st.subheader("Key Model Table")
     if len(results_table) > 0:
         display_cols = ["question", "model", "model_desc", "term_label", "coefficient", "std_error", "p_value", "nobs", "r_squared"]
-        st.dataframe(results_table[display_cols], use_container_width=True)
+        st.dataframe(results_table[display_cols], width="stretch")
     else:
         st.warning("No model results available.")
 
@@ -945,7 +939,7 @@ elif page == "Q1 Gender Pay Gap":
                 opacity=0.60,
                 title="Hourly Wage Distribution by Gender"
             )
-            st.plotly_chart(fig_hist, use_container_width=True)
+            st.plotly_chart(fig_hist, width="stretch")
         else:
             st.warning("No data available for histogram.")
 
@@ -960,7 +954,7 @@ elif page == "Q1 Gender Pay Gap":
                     color="sex_label",
                     title="Hourly Wage by Gender"
                 )
-                st.plotly_chart(fig_box, use_container_width=True)
+                st.plotly_chart(fig_box, width="stretch")
             else:
                 st.warning("No trimmed data available for box plot.")
         else:
@@ -979,7 +973,7 @@ elif page == "Q1 Gender Pay Gap":
                 title="Lowest Female-to-Male Wage Ratios by Occupation Group"
             )
             fig_occ.add_vline(x=1.0, line_dash="dash")
-            st.plotly_chart(fig_occ, use_container_width=True)
+            st.plotly_chart(fig_occ, width="stretch")
         else:
             st.warning("No occupation ratio data available.")
     else:
@@ -989,7 +983,7 @@ elif page == "Q1 Gender Pay Gap":
     if len(q1_results) > 0:
         st.dataframe(
             q1_results[["model", "model_desc", "term_label", "coefficient", "std_error", "p_value", "nobs", "r_squared"]],
-            use_container_width=True
+            width="stretch"
         )
 
 # -----------------------------
@@ -1039,7 +1033,7 @@ elif page == "Q2 Prior Salary and Ban":
                 opacity=0.40,
                 title="Prior Wage vs Current Wage"
             )
-            st.plotly_chart(fig_scatter, use_container_width=True)
+            st.plotly_chart(fig_scatter, width="stretch")
         else:
             st.warning("No lag data available for scatter plot.")
     else:
@@ -1055,7 +1049,7 @@ elif page == "Q2 Prior Salary and Ban":
     if len(q2_results) > 0:
         st.dataframe(
             q2_results[["model", "model_desc", "term_label", "coefficient", "std_error", "p_value", "nobs", "r_squared"]],
-            use_container_width=True
+            width="stretch"
         )
 
 # -----------------------------
@@ -1108,11 +1102,11 @@ elif page == "Q3 Post-2018 Policy":
             xaxis_title="Coefficient",
             yaxis_title=""
         )
-        st.plotly_chart(fig_q3_coef, use_container_width=True)
+        st.plotly_chart(fig_q3_coef, width="stretch")
 
         st.dataframe(
             q3_results[["model", "model_desc", "term_label", "coefficient", "std_error", "p_value", "nobs", "r_squared"]],
-            use_container_width=True
+            width="stretch"
         )
 
 # -----------------------------
@@ -1152,7 +1146,7 @@ elif page == "Q4 Hidden Factors and Limits":
                     title="Lowest Female-to-Male Wage Ratios by Occupation Group"
                 )
                 fig_occ.add_vline(x=1.0, line_dash="dash")
-                st.plotly_chart(fig_occ, use_container_width=True)
+                st.plotly_chart(fig_occ, width="stretch")
             else:
                 st.warning("No occupation ratio data available.")
         else:
@@ -1171,7 +1165,7 @@ elif page == "Q4 Hidden Factors and Limits":
                     title="Lowest Female-to-Male Wage Ratios by Industry Group"
                 )
                 fig_ind.add_vline(x=1.0, line_dash="dash")
-                st.plotly_chart(fig_ind, use_container_width=True)
+                st.plotly_chart(fig_ind, width="stretch")
             else:
                 st.warning("No industry ratio data available.")
         else:
@@ -1194,7 +1188,8 @@ elif page == "AI Wage Simulator":
     default_year = int(df["Year"].max()) if "Year" in df.columns and df["Year"].notna().any() else 2021
     default_age = int(clamp(np.nanmedian(df["age"]) if "age" in df.columns and df["age"].notna().any() else 30, 18, 70))
     default_hgc = float(clamp(np.nanmedian(df["HGC"]) if "HGC" in df.columns and df["HGC"].notna().any() else 16.0, 0.0, 25.0))
-    default_tenure = float(clamp(np.nanmedian(df["TENURE"]) if "TENURE" in df.columns and df["TENURE"].notna().any() else 2.0, 0.0, 40.0))
+    raw_default_tenure = np.nanmedian(df["TENURE"]) if "TENURE" in df.columns and df["TENURE"].notna().any() else 2.0
+    default_tenure = float(min(max(raw_default_tenure, 0.0), 40.0))
     default_hours = float(clamp(np.nanmedian(df["HRS_WRK"]) if "HRS_WRK" in df.columns and df["HRS_WRK"].notna().any() else 40.0, 1.0, 120.0))
     default_prior_wage = float(clamp(np.nanmedian(df_lag["prior_wage"]) if len(df_lag) > 0 and "prior_wage" in df_lag.columns else 25.0, 0.5, 500.0))
 
@@ -1216,9 +1211,9 @@ elif page == "AI Wage Simulator":
         marital_choices = [-1]
 
     with st.form("simulator_form"):
-        f1, f2, f3 = st.columns(3)
+        sim_col1, sim_col2, sim_col3 = st.columns(3)
 
-        with f1:
+        with sim_col1:
             sim_year = st.number_input(
                 "Base year",
                 min_value=year_min_allowed,
@@ -1230,13 +1225,19 @@ elif page == "AI Wage Simulator":
             sim_race = safe_selectbox("Race", race_choices, default_index=0, key="sim_race")
             sim_region = safe_selectbox("Region", region_choices, default_index=0, key="sim_region")
 
-        with f2:
+        with sim_col2:
             sim_marital = safe_selectbox("Marital status code", marital_choices, default_index=0, key="sim_marital")
             sim_age = st.number_input("Age", min_value=18, max_value=70, value=int(clamp(default_age, 18, 70)), step=1)
             sim_hgc = st.number_input("Education (HGC)", min_value=0.0, max_value=25.0, value=float(clamp(default_hgc, 0.0, 25.0)), step=0.5)
-            sim_tenure = st.number_input("Tenure", min_value=0.0, max_value=40.0, value=float(clamp(default_tenure, 0.0, 40.0)), step=0.5)
+            sim_tenure = st.number_input(
+                "Tenure",
+                min_value=0.0,
+                max_value=40.0,
+                value=float(min(max(default_tenure, 0.0), 40.0)),
+                step=0.5
+            )
 
-        with f3:
+        with sim_col3:
             sim_hours = st.number_input("Weekly hours worked", min_value=1.0, max_value=120.0, value=float(clamp(default_hours, 1.0, 120.0)), step=1.0)
             sim_prior_wage = st.number_input("Prior wage", min_value=0.5, max_value=500.0, value=float(clamp(default_prior_wage, 0.5, 500.0)), step=0.5)
             sim_occ = safe_selectbox("Occupation group", occ_choices, default_index=0, key="sim_occ")
@@ -1297,7 +1298,7 @@ elif page == "AI Wage Simulator":
                 markers=True,
                 title="Projected Wage Path"
             )
-            st.plotly_chart(fig_pred, use_container_width=True)
+            st.plotly_chart(fig_pred, width="stretch")
 
             st.subheader("Same Profile, Different Gender")
             gender_compare = same_profile_gender_comparison(models.get("F_BASE"), base_inputs)
@@ -1309,7 +1310,7 @@ elif page == "AI Wage Simulator":
                     color="sex_label",
                     title="Predicted Wage Under the Same Observed Profile"
                 )
-                st.plotly_chart(fig_gender, use_container_width=True)
+                st.plotly_chart(fig_gender, width="stretch")
 
             st.subheader("With vs Without Prior Wage Information")
             prior_compare = prior_wage_policy_comparison(models.get("F_PRIOR"), models.get("F_BASE"), base_inputs)
@@ -1321,7 +1322,7 @@ elif page == "AI Wage Simulator":
                     color="scenario",
                     title="Predicted Wage Under Alternative Prior-Wage Information Regimes"
                 )
-                st.plotly_chart(fig_prior, use_container_width=True)
+                st.plotly_chart(fig_prior, width="stretch")
 
             st.subheader("Pre-2018 vs Post-2018 Policy Proxy")
             policy_compare = pre_post_policy_comparison(models.get("F_POLICY"), base_inputs)
@@ -1333,12 +1334,12 @@ elif page == "AI Wage Simulator":
                     color="policy_period",
                     title="Predicted Wage Under Pre-2018 and Post-2018 Proxies"
                 )
-                st.plotly_chart(fig_policy, use_container_width=True)
+                st.plotly_chart(fig_policy, width="stretch")
 
             st.subheader("Model Comparison")
             compare_df = compare_model_predictions(models, base_inputs)
             if len(compare_df) > 0:
-                st.dataframe(compare_df, use_container_width=True)
+                st.dataframe(compare_df, width="stretch")
 
             st.info(
                 "How to read the simulator: baseline compares same-profile male and female predictions. Prior wage comparison shows how salary-history reliance can preserve wage differences. Policy comparison shows that the prior-pay relationship does not automatically fall to zero."
@@ -1353,13 +1354,13 @@ elif page == "AI Wage Simulator":
 # -----------------------------
 elif page == "Data Preview":
     st.subheader("Raw Data Preview")
-    st.dataframe(df_raw.head(MAX_PREVIEW_ROWS), use_container_width=True)
+    st.dataframe(df_raw.head(MAX_PREVIEW_ROWS), width="stretch")
 
     st.subheader("Cleaned Main Sample Preview")
-    st.dataframe(filtered.head(MAX_PREVIEW_ROWS), use_container_width=True)
+    st.dataframe(filtered.head(MAX_PREVIEW_ROWS), width="stretch")
 
     st.subheader("Lag Sample Preview")
-    st.dataframe(lag_filtered.head(MAX_PREVIEW_ROWS), use_container_width=True)
+    st.dataframe(lag_filtered.head(MAX_PREVIEW_ROWS), width="stretch")
 
     st.subheader("Column Names")
     st.write(df_raw.columns.tolist())
