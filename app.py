@@ -86,24 +86,32 @@ def human_term(term):
 
 def make_model_sample(df, max_rows, seed=42):
     if df is None or len(df) == 0:
-        return df
+        return df.copy() if isinstance(df, pd.DataFrame) else pd.DataFrame()
     if len(df) <= max_rows:
         return df.copy()
     return df.sample(max_rows, random_state=seed).copy()
 
 def maybe_sample_for_scatter(df, max_rows=MAX_SCATTER_POINTS, seed=42):
     if df is None or len(df) == 0:
-        return df
+        return df.copy() if isinstance(df, pd.DataFrame) else pd.DataFrame()
     if len(df) <= max_rows:
         return df.copy()
     return df.sample(max_rows, random_state=seed).copy()
+
+def safe_selectbox(label, options, default_index=0, key=None):
+    if not options:
+        st.warning(f"No available options for {label}.")
+        return None
+    idx = min(max(default_index, 0), len(options) - 1)
+    return st.selectbox(label, options, index=idx, key=key)
 
 # -----------------------------
 # Data loading
 # -----------------------------
 @st.cache_data(show_spinner=True)
 def load_data_from_github_zip(zip_url: str) -> pd.DataFrame:
-    response = requests.get(zip_url, timeout=180)
+    headers = {"User-Agent": "Mozilla/5.0"}
+    response = requests.get(zip_url, timeout=180, headers=headers)
     response.raise_for_status()
 
     zip_bytes = io.BytesIO(response.content)
@@ -124,7 +132,7 @@ def load_data_from_github_zip(zip_url: str) -> pd.DataFrame:
 @st.cache_data(show_spinner=True)
 def preprocess_data(df_raw: pd.DataFrame):
     df = df_raw.copy()
-    df.columns = [c.strip() for c in df.columns]
+    df.columns = [str(c).strip() for c in df.columns]
 
     numeric_cols = [
         "PUBID_1997", "SAMPLE_RACE_1997", "SAMPLE_SEX_1997", "Year",
@@ -141,6 +149,10 @@ def preprocess_data(df_raw: pd.DataFrame):
         if col in df.columns:
             df[col] = pd.to_datetime(df[col], errors="coerce")
 
+    # Required wage column check
+    if "HRLY_WAGE" not in df.columns:
+        raise KeyError("Required column 'HRLY_WAGE' not found in dataset.")
+
     # Core cleaning
     if "Employed" in df.columns:
         df = df[df["Employed"] == 1].copy()
@@ -149,9 +161,10 @@ def preprocess_data(df_raw: pd.DataFrame):
     df = df[df["HRLY_WAGE"] > 0].copy()
 
     # Trim extreme wages
-    wage_low = df["HRLY_WAGE"].quantile(0.01)
-    wage_high = df["HRLY_WAGE"].quantile(0.99)
-    df = df[(df["HRLY_WAGE"] >= wage_low) & (df["HRLY_WAGE"] <= wage_high)].copy()
+    if len(df) > 0:
+        wage_low = df["HRLY_WAGE"].quantile(0.01)
+        wage_high = df["HRLY_WAGE"].quantile(0.99)
+        df = df[(df["HRLY_WAGE"] >= wage_low) & (df["HRLY_WAGE"] <= wage_high)].copy()
 
     if "HRS_WRK" in df.columns:
         df = df[(df["HRS_WRK"].isna()) | ((df["HRS_WRK"] > 0) & (df["HRS_WRK"] <= 120))].copy()
@@ -203,7 +216,7 @@ def preprocess_data(df_raw: pd.DataFrame):
         if col not in df.columns:
             df[col] = "Unknown"
         else:
-            df[col] = df[col].astype(str).fillna("Unknown")
+            df[col] = df[col].fillna("Unknown").astype(str)
 
     if "marital_status" not in df.columns:
         df["marital_status"] = -1
@@ -256,7 +269,7 @@ def preprocess_data(df_raw: pd.DataFrame):
 @st.cache_data(show_spinner=True)
 def build_summaries(df, df_lag):
     year_gender = pd.DataFrame()
-    if "Year" in df.columns:
+    if "Year" in df.columns and "sex_label" in df.columns and "HRLY_WAGE" in df.columns and len(df) > 0:
         year_gender = (
             df.groupby(["Year", "sex_label"], as_index=False)
               .agg(
@@ -266,30 +279,34 @@ def build_summaries(df, df_lag):
               )
         )
 
-    occupation_gap = (
-        df.groupby(["Occupation_Group2", "sex_label"], as_index=False)
-          .agg(mean_wage=("HRLY_WAGE", "mean"), n=("HRLY_WAGE", "size"))
-    )
-    occupation_pivot = occupation_gap.pivot(index="Occupation_Group2", columns="sex_label", values="mean_wage")
-    if "Female" in occupation_pivot.columns and "Male" in occupation_pivot.columns:
-        occupation_pivot["female_to_male_ratio"] = occupation_pivot["Female"] / occupation_pivot["Male"]
-    else:
-        occupation_pivot["female_to_male_ratio"] = np.nan
-    occupation_pivot = occupation_pivot.reset_index()
+    occupation_pivot = pd.DataFrame(columns=["Occupation_Group2", "female_to_male_ratio"])
+    if {"Occupation_Group2", "sex_label", "HRLY_WAGE"}.issubset(df.columns):
+        occupation_gap = (
+            df.groupby(["Occupation_Group2", "sex_label"], as_index=False)
+              .agg(mean_wage=("HRLY_WAGE", "mean"), n=("HRLY_WAGE", "size"))
+        )
+        occupation_pivot = occupation_gap.pivot(index="Occupation_Group2", columns="sex_label", values="mean_wage")
+        if "Female" in occupation_pivot.columns and "Male" in occupation_pivot.columns:
+            occupation_pivot["female_to_male_ratio"] = occupation_pivot["Female"] / occupation_pivot["Male"]
+        else:
+            occupation_pivot["female_to_male_ratio"] = np.nan
+        occupation_pivot = occupation_pivot.reset_index()
 
-    industry_gap = (
-        df.groupby(["Industry_Group", "sex_label"], as_index=False)
-          .agg(mean_wage=("HRLY_WAGE", "mean"), n=("HRLY_WAGE", "size"))
-    )
-    industry_pivot = industry_gap.pivot(index="Industry_Group", columns="sex_label", values="mean_wage")
-    if "Female" in industry_pivot.columns and "Male" in industry_pivot.columns:
-        industry_pivot["female_to_male_ratio"] = industry_pivot["Female"] / industry_pivot["Male"]
-    else:
-        industry_pivot["female_to_male_ratio"] = np.nan
-    industry_pivot = industry_pivot.reset_index()
+    industry_pivot = pd.DataFrame(columns=["Industry_Group", "female_to_male_ratio"])
+    if {"Industry_Group", "sex_label", "HRLY_WAGE"}.issubset(df.columns):
+        industry_gap = (
+            df.groupby(["Industry_Group", "sex_label"], as_index=False)
+              .agg(mean_wage=("HRLY_WAGE", "mean"), n=("HRLY_WAGE", "size"))
+        )
+        industry_pivot = industry_gap.pivot(index="Industry_Group", columns="sex_label", values="mean_wage")
+        if "Female" in industry_pivot.columns and "Male" in industry_pivot.columns:
+            industry_pivot["female_to_male_ratio"] = industry_pivot["Female"] / industry_pivot["Male"]
+        else:
+            industry_pivot["female_to_male_ratio"] = np.nan
+        industry_pivot = industry_pivot.reset_index()
 
     prior_scatter = df_lag.copy()
-    if len(prior_scatter) > 0:
+    if len(prior_scatter) > 0 and {"HRLY_WAGE", "prior_wage"}.issubset(prior_scatter.columns):
         prior_scatter = prior_scatter[
             (prior_scatter["HRLY_WAGE"] <= prior_scatter["HRLY_WAGE"].quantile(0.99)) &
             (prior_scatter["prior_wage"] <= prior_scatter["prior_wage"].quantile(0.99))
@@ -303,6 +320,8 @@ def build_summaries(df, df_lag):
 # -----------------------------
 def fit_ols(formula, data):
     try:
+        if data is None or len(data) == 0:
+            return None
         model = smf.ols(formula=formula, data=data).fit()
         return model
     except Exception:
@@ -378,7 +397,6 @@ def fit_models(df, df_lag):
 
     return models
 
-@st.cache_data(show_spinner=False)
 def extract_model_table(models):
     rows = []
 
@@ -435,30 +453,45 @@ def extract_model_table(models):
 # -----------------------------
 def filter_main_data(df, year_range, selected_gender, selected_race, selected_region):
     filtered = df.copy()
-    if year_range is not None:
+    if year_range is not None and "Year" in filtered.columns:
         filtered = filtered[(filtered["Year"] >= year_range[0]) & (filtered["Year"] <= year_range[1])]
-    filtered = filtered[filtered["sex_label"].isin(selected_gender)]
-    filtered = filtered[filtered["race_label"].isin(selected_race)]
-    filtered = filtered[filtered["region_label"].isin(selected_region)]
+
+    if "sex_label" in filtered.columns and selected_gender:
+        filtered = filtered[filtered["sex_label"].isin(selected_gender)]
+    if "race_label" in filtered.columns and selected_race:
+        filtered = filtered[filtered["race_label"].isin(selected_race)]
+    if "region_label" in filtered.columns and selected_region:
+        filtered = filtered[filtered["region_label"].isin(selected_region)]
+
     return filtered
 
 def filter_lag_data(df_lag, year_range, selected_gender, selected_race, selected_region):
     filtered = df_lag.copy()
     if year_range is not None and "Year" in filtered.columns:
         filtered = filtered[(filtered["Year"] >= year_range[0]) & (filtered["Year"] <= year_range[1])]
-    filtered = filtered[filtered["sex_label"].isin(selected_gender)]
-    filtered = filtered[filtered["race_label"].isin(selected_race)]
-    filtered = filtered[filtered["region_label"].isin(selected_region)]
+
+    if "sex_label" in filtered.columns and selected_gender:
+        filtered = filtered[filtered["sex_label"].isin(selected_gender)]
+    if "race_label" in filtered.columns and selected_race:
+        filtered = filtered[filtered["race_label"].isin(selected_race)]
+    if "region_label" in filtered.columns and selected_region:
+        filtered = filtered[filtered["region_label"].isin(selected_region)]
+
     return filtered
 
 def build_summary_cards(df_filtered):
+    male_mean = np.nan
+    female_mean = np.nan
+    raw_gap_pct = np.nan
+
+    if len(df_filtered) == 0 or "sex_label" not in df_filtered.columns or "HRLY_WAGE" not in df_filtered.columns:
+        return male_mean, female_mean, raw_gap_pct
+
     male_mean = df_filtered.loc[df_filtered["sex_label"] == "Male", "HRLY_WAGE"].mean()
     female_mean = df_filtered.loc[df_filtered["sex_label"] == "Female", "HRLY_WAGE"].mean()
 
     if pd.notna(male_mean) and male_mean != 0 and pd.notna(female_mean):
         raw_gap_pct = 100 * (female_mean / male_mean - 1)
-    else:
-        raw_gap_pct = np.nan
 
     return male_mean, female_mean, raw_gap_pct
 
@@ -549,7 +582,7 @@ def build_profile_row(
         "Occupation_Group2": occupation_group,
         "Industry_Group": industry_group,
         "prior_wage": prior_wage,
-        "ln_prior_wage": np.log(prior_wage) if prior_wage and prior_wage > 0 else np.nan,
+        "ln_prior_wage": np.log(prior_wage) if pd.notna(prior_wage) and prior_wage > 0 else np.nan,
         "post_2018": post_2018
     }])
     return row
@@ -575,13 +608,17 @@ def predict_wage_path(model, horizons, base_inputs):
             industry_group=base_inputs["industry_group"],
             prior_wage=base_inputs["prior_wage"]
         )
-        pred_ln = float(model.predict(row)[0])
-        pred_wage = float(np.exp(pred_ln))
-        rows.append({
-            "horizon_years": h,
-            "projected_year": year_value,
-            "predicted_wage": pred_wage
-        })
+        try:
+            pred_ln = float(model.predict(row)[0])
+            pred_wage = float(np.exp(pred_ln))
+            rows.append({
+                "horizon_years": h,
+                "projected_year": year_value,
+                "predicted_wage": pred_wage
+            })
+        except Exception:
+            continue
+
     return pd.DataFrame(rows)
 
 def same_profile_gender_comparison(model, base_inputs):
@@ -604,11 +641,15 @@ def same_profile_gender_comparison(model, base_inputs):
             industry_group=base_inputs["industry_group"],
             prior_wage=base_inputs["prior_wage"]
         )
-        pred_ln = float(model.predict(row)[0])
-        rows.append({
-            "sex_label": sex_label,
-            "predicted_wage": float(np.exp(pred_ln))
-        })
+        try:
+            pred_ln = float(model.predict(row)[0])
+            rows.append({
+                "sex_label": sex_label,
+                "predicted_wage": float(np.exp(pred_ln))
+            })
+        except Exception:
+            continue
+
     return pd.DataFrame(rows)
 
 def prior_wage_policy_comparison(model_with_prior, model_without_prior, base_inputs):
@@ -631,8 +672,11 @@ def prior_wage_policy_comparison(model_with_prior, model_without_prior, base_inp
         industry_group=base_inputs["industry_group"],
         prior_wage=base_inputs["prior_wage"]
     )
-    pred_with = float(np.exp(model_with_prior.predict(row_with)[0]))
-    rows.append({"scenario": "With prior wage information", "predicted_wage": pred_with})
+    try:
+        pred_with = float(np.exp(model_with_prior.predict(row_with)[0]))
+        rows.append({"scenario": "With prior wage information", "predicted_wage": pred_with})
+    except Exception:
+        pass
 
     row_without = build_profile_row(
         year_value=base_inputs["year_value"],
@@ -648,8 +692,11 @@ def prior_wage_policy_comparison(model_with_prior, model_without_prior, base_inp
         industry_group=base_inputs["industry_group"],
         prior_wage=max(base_inputs["prior_wage"], 1e-6)
     )
-    pred_without = float(np.exp(model_without_prior.predict(row_without)[0]))
-    rows.append({"scenario": "Without prior wage information", "predicted_wage": pred_without})
+    try:
+        pred_without = float(np.exp(model_without_prior.predict(row_without)[0]))
+        rows.append({"scenario": "Without prior wage information", "predicted_wage": pred_without})
+    except Exception:
+        pass
 
     return pd.DataFrame(rows)
 
@@ -673,12 +720,16 @@ def pre_post_policy_comparison(model_policy, base_inputs):
             industry_group=base_inputs["industry_group"],
             prior_wage=base_inputs["prior_wage"]
         )
-        pred = float(np.exp(model_policy.predict(row)[0]))
-        rows.append({
-            "policy_period": "Pre-2018 proxy" if yr < 2018 else "Post-2018 proxy",
-            "year_used": yr,
-            "predicted_wage": pred
-        })
+        try:
+            pred = float(np.exp(model_policy.predict(row)[0]))
+            rows.append({
+                "policy_period": "Pre-2018 proxy" if yr < 2018 else "Post-2018 proxy",
+                "year_used": yr,
+                "predicted_wage": pred
+            })
+        except Exception:
+            continue
+
     return pd.DataFrame(rows)
 
 def compare_model_predictions(models, base_inputs):
@@ -709,13 +760,17 @@ def compare_model_predictions(models, base_inputs):
             industry_group=base_inputs["industry_group"],
             prior_wage=base_inputs["prior_wage"]
         )
-        pred = float(np.exp(model.predict(row)[0]))
-        rows.append({
-            "model": label,
-            "predicted_wage": pred,
-            "r_squared": getattr(model, "rsquared", np.nan),
-            "nobs": int(getattr(model, "nobs", np.nan))
-        })
+        try:
+            pred = float(np.exp(model.predict(row)[0]))
+            nobs_val = getattr(model, "nobs", np.nan)
+            rows.append({
+                "model": label,
+                "predicted_wage": pred,
+                "r_squared": getattr(model, "rsquared", np.nan),
+                "nobs": int(nobs_val) if pd.notna(nobs_val) else np.nan
+            })
+        except Exception:
+            continue
 
     return pd.DataFrame(rows)
 
@@ -725,12 +780,16 @@ def compare_model_predictions(models, base_inputs):
 st.title("Datathon 2026 Dashboard")
 st.caption("Gender pay gap, prior salary effects, policy interpretation, and user-facing wage prediction")
 
-with st.spinner("Loading data, summaries, and cloud-safe models..."):
-    df_raw = load_data_from_github_zip(ZIP_URL)
-    df, df_lag = preprocess_data(df_raw)
-    year_gender, occupation_pivot, industry_pivot, prior_scatter = build_summaries(df, df_lag)
-    models = fit_models(df, df_lag)
-    results_table = extract_model_table(models)
+try:
+    with st.spinner("Loading data, summaries, and cloud-safe models..."):
+        df_raw = load_data_from_github_zip(ZIP_URL)
+        df, df_lag = preprocess_data(df_raw)
+        year_gender, occupation_pivot, industry_pivot, prior_scatter = build_summaries(df, df_lag)
+        models = fit_models(df, df_lag)
+        results_table = extract_model_table(models)
+except Exception as e:
+    st.error(f"App failed during initialization: {e}")
+    st.stop()
 
 # -----------------------------
 # Sidebar
@@ -758,13 +817,13 @@ if "Year" in df.columns and df["Year"].notna().any():
 else:
     year_range = None
 
-gender_options = sorted(df["sex_label"].dropna().unique().tolist())
+gender_options = sorted(df["sex_label"].dropna().unique().tolist()) if "sex_label" in df.columns else []
 selected_gender = st.sidebar.multiselect("Gender", gender_options, default=gender_options)
 
-race_options = sorted(df["race_label"].dropna().unique().tolist())
+race_options = sorted(df["race_label"].dropna().unique().tolist()) if "race_label" in df.columns else []
 selected_race = st.sidebar.multiselect("Race", race_options, default=race_options)
 
-region_options = sorted(df["region_label"].dropna().unique().tolist())
+region_options = sorted(df["region_label"].dropna().unique().tolist()) if "region_label" in df.columns else []
 selected_region = st.sidebar.multiselect("Region", region_options, default=region_options)
 
 filtered = filter_main_data(df, year_range, selected_gender, selected_race, selected_region)
@@ -778,7 +837,7 @@ male_mean, female_mean, raw_gap_pct = build_summary_cards(filtered)
 c1, c2, c3, c4, c5 = st.columns(5)
 c1.metric("Observations", f"{len(filtered):,}")
 c2.metric("Individuals", f"{filtered['PUBID_1997'].nunique():,}" if "PUBID_1997" in filtered.columns else "N/A")
-c3.metric("Average hourly wage", f"{filtered['HRLY_WAGE'].mean():.2f}" if len(filtered) else "N/A")
+c3.metric("Average hourly wage", f"{filtered['HRLY_WAGE'].mean():.2f}" if len(filtered) and "HRLY_WAGE" in filtered.columns else "N/A")
 c4.metric("Male average wage", f"{male_mean:.2f}" if pd.notna(male_mean) else "N/A")
 c5.metric("Female average wage", f"{female_mean:.2f}" if pd.notna(female_mean) else "N/A")
 
@@ -801,21 +860,22 @@ if page == "Overview":
         "Performance note: Interactive models in this dashboard are cloud-safe approximations trained on sampled data for responsiveness. Descriptive charts use the cleaned full sample."
     )
 
-    if len(filtered) > 0 and "Year" in filtered.columns:
+    if len(filtered) > 0 and "Year" in filtered.columns and "sex_label" in filtered.columns and "HRLY_WAGE" in filtered.columns:
         summary = (
             filtered.groupby(["Year", "sex_label"], as_index=False)["HRLY_WAGE"]
             .mean()
             .rename(columns={"HRLY_WAGE": "mean_wage"})
         )
-        fig = px.line(
-            summary,
-            x="Year",
-            y="mean_wage",
-            color="sex_label",
-            markers=True,
-            title="Average Hourly Wage by Gender Over Time"
-        )
-        st.plotly_chart(fig, use_container_width=True)
+        if len(summary) > 0:
+            fig = px.line(
+                summary,
+                x="Year",
+                y="mean_wage",
+                color="sex_label",
+                markers=True,
+                title="Average Hourly Wage by Gender Over Time"
+            )
+            st.plotly_chart(fig, use_container_width=True)
 
     st.subheader("Key Model Table")
     if len(results_table) > 0:
@@ -845,40 +905,55 @@ elif page == "Q1 Gender Pay Gap":
     a, b = st.columns(2)
 
     with a:
-        fig_hist = px.histogram(
-            filtered,
-            x="HRLY_WAGE",
-            color="sex_label",
-            barmode="overlay",
-            nbins=50,
-            opacity=0.60,
-            title="Hourly Wage Distribution by Gender"
-        )
-        st.plotly_chart(fig_hist, use_container_width=True)
+        if len(filtered) > 0 and {"HRLY_WAGE", "sex_label"}.issubset(filtered.columns):
+            fig_hist = px.histogram(
+                filtered,
+                x="HRLY_WAGE",
+                color="sex_label",
+                barmode="overlay",
+                nbins=50,
+                opacity=0.60,
+                title="Hourly Wage Distribution by Gender"
+            )
+            st.plotly_chart(fig_hist, use_container_width=True)
+        else:
+            st.warning("No data available for histogram.")
 
     with b:
-        trimmed = filtered[filtered["HRLY_WAGE"] <= filtered["HRLY_WAGE"].quantile(0.95)].copy()
-        fig_box = px.box(
-            trimmed,
-            x="sex_label",
-            y="HRLY_WAGE",
-            color="sex_label",
-            title="Hourly Wage by Gender"
-        )
-        st.plotly_chart(fig_box, use_container_width=True)
+        if len(filtered) > 0 and {"HRLY_WAGE", "sex_label"}.issubset(filtered.columns):
+            trimmed = filtered[filtered["HRLY_WAGE"] <= filtered["HRLY_WAGE"].quantile(0.95)].copy()
+            if len(trimmed) > 0:
+                fig_box = px.box(
+                    trimmed,
+                    x="sex_label",
+                    y="HRLY_WAGE",
+                    color="sex_label",
+                    title="Hourly Wage by Gender"
+                )
+                st.plotly_chart(fig_box, use_container_width=True)
+            else:
+                st.warning("No trimmed data available for box plot.")
+        else:
+            st.warning("No data available for box plot.")
 
     st.subheader("Occupation-Level Context")
-    occ_plot = occupation_pivot.dropna(subset=["female_to_male_ratio"]).copy()
-    occ_plot = occ_plot.sort_values("female_to_male_ratio").head(12)
-    fig_occ = px.bar(
-        occ_plot,
-        x="female_to_male_ratio",
-        y="Occupation_Group2",
-        orientation="h",
-        title="Lowest Female-to-Male Wage Ratios by Occupation Group"
-    )
-    fig_occ.add_vline(x=1.0, line_dash="dash")
-    st.plotly_chart(fig_occ, use_container_width=True)
+    if len(occupation_pivot) > 0 and "female_to_male_ratio" in occupation_pivot.columns:
+        occ_plot = occupation_pivot.dropna(subset=["female_to_male_ratio"]).copy()
+        occ_plot = occ_plot.sort_values("female_to_male_ratio").head(12)
+        if len(occ_plot) > 0:
+            fig_occ = px.bar(
+                occ_plot,
+                x="female_to_male_ratio",
+                y="Occupation_Group2",
+                orientation="h",
+                title="Lowest Female-to-Male Wage Ratios by Occupation Group"
+            )
+            fig_occ.add_vline(x=1.0, line_dash="dash")
+            st.plotly_chart(fig_occ, use_container_width=True)
+        else:
+            st.warning("No occupation ratio data available.")
+    else:
+        st.warning("Occupation summary is not available.")
 
     st.subheader("Q1 Model Output")
     if len(q1_results) > 0:
@@ -918,26 +993,33 @@ elif page == "Q2 Prior Salary and Ban":
 
     st.subheader("Prior Wage vs Current Wage")
     plot_lag = lag_filtered.copy()
-    if len(plot_lag) > 0:
+    if len(plot_lag) > 0 and {"HRLY_WAGE", "prior_wage", "sex_label"}.issubset(plot_lag.columns):
         plot_lag = plot_lag[
             (plot_lag["HRLY_WAGE"] <= plot_lag["HRLY_WAGE"].quantile(0.99)) &
             (plot_lag["prior_wage"] <= plot_lag["prior_wage"].quantile(0.99))
         ].copy()
         plot_lag = maybe_sample_for_scatter(plot_lag, max_rows=MAX_SCATTER_POINTS)
 
-    fig_scatter = px.scatter(
-        plot_lag,
-        x="prior_wage",
-        y="HRLY_WAGE",
-        color="sex_label",
-        opacity=0.40,
-        title="Prior Wage vs Current Wage"
-    )
-    st.plotly_chart(fig_scatter, use_container_width=True)
+        if len(plot_lag) > 0:
+            fig_scatter = px.scatter(
+                plot_lag,
+                x="prior_wage",
+                y="HRLY_WAGE",
+                color="sex_label",
+                opacity=0.40,
+                title="Prior Wage vs Current Wage"
+            )
+            st.plotly_chart(fig_scatter, use_container_width=True)
+        else:
+            st.warning("No lag data available for scatter plot.")
+    else:
+        st.warning("Required lag variables are not available for scatter plot.")
 
-    if len(lag_filtered) > 0:
-        corr_value = lag_filtered[["prior_wage", "HRLY_WAGE"]].corr().iloc[0, 1]
-        st.metric("Correlation: prior wage vs current wage", f"{corr_value:.3f}")
+    if len(lag_filtered) > 1 and {"prior_wage", "HRLY_WAGE"}.issubset(lag_filtered.columns):
+        corr_df = lag_filtered[["prior_wage", "HRLY_WAGE"]].dropna()
+        if len(corr_df) > 1:
+            corr_value = corr_df.corr().iloc[0, 1]
+            st.metric("Correlation: prior wage vs current wage", f"{corr_value:.3f}")
 
     st.subheader("Q2 Model Output")
     if len(q2_results) > 0:
@@ -1028,30 +1110,42 @@ elif page == "Q4 Hidden Factors and Limits":
     c, d = st.columns(2)
 
     with c:
-        occ_plot = occupation_pivot.dropna(subset=["female_to_male_ratio"]).copy()
-        occ_plot = occ_plot.sort_values("female_to_male_ratio").head(15)
-        fig_occ = px.bar(
-            occ_plot,
-            x="female_to_male_ratio",
-            y="Occupation_Group2",
-            orientation="h",
-            title="Lowest Female-to-Male Wage Ratios by Occupation Group"
-        )
-        fig_occ.add_vline(x=1.0, line_dash="dash")
-        st.plotly_chart(fig_occ, use_container_width=True)
+        if len(occupation_pivot) > 0 and "female_to_male_ratio" in occupation_pivot.columns:
+            occ_plot = occupation_pivot.dropna(subset=["female_to_male_ratio"]).copy()
+            occ_plot = occ_plot.sort_values("female_to_male_ratio").head(15)
+            if len(occ_plot) > 0:
+                fig_occ = px.bar(
+                    occ_plot,
+                    x="female_to_male_ratio",
+                    y="Occupation_Group2",
+                    orientation="h",
+                    title="Lowest Female-to-Male Wage Ratios by Occupation Group"
+                )
+                fig_occ.add_vline(x=1.0, line_dash="dash")
+                st.plotly_chart(fig_occ, use_container_width=True)
+            else:
+                st.warning("No occupation ratio data available.")
+        else:
+            st.warning("Occupation summary is not available.")
 
     with d:
-        ind_plot = industry_pivot.dropna(subset=["female_to_male_ratio"]).copy()
-        ind_plot = ind_plot.sort_values("female_to_male_ratio").head(15)
-        fig_ind = px.bar(
-            ind_plot,
-            x="female_to_male_ratio",
-            y="Industry_Group",
-            orientation="h",
-            title="Lowest Female-to-Male Wage Ratios by Industry Group"
-        )
-        fig_ind.add_vline(x=1.0, line_dash="dash")
-        st.plotly_chart(fig_ind, use_container_width=True)
+        if len(industry_pivot) > 0 and "female_to_male_ratio" in industry_pivot.columns:
+            ind_plot = industry_pivot.dropna(subset=["female_to_male_ratio"]).copy()
+            ind_plot = ind_plot.sort_values("female_to_male_ratio").head(15)
+            if len(ind_plot) > 0:
+                fig_ind = px.bar(
+                    ind_plot,
+                    x="female_to_male_ratio",
+                    y="Industry_Group",
+                    orientation="h",
+                    title="Lowest Female-to-Male Wage Ratios by Industry Group"
+                )
+                fig_ind.add_vline(x=1.0, line_dash="dash")
+                st.plotly_chart(fig_ind, use_container_width=True)
+            else:
+                st.warning("No industry ratio data available.")
+        else:
+            st.warning("Industry summary is not available.")
 
     st.warning(
         "Limitation note: The dataset does not directly observe whether employers explicitly asked for salary history. The dashboard therefore supports policy rationale and association patterns rather than strict causal identification."
@@ -1072,13 +1166,24 @@ elif page == "AI Wage Simulator":
     default_hgc = float(clamp(np.nanmedian(df["HGC"]) if "HGC" in df.columns and df["HGC"].notna().any() else 16.0, 0.0, 25.0))
     default_tenure = float(clamp(np.nanmedian(df["TENURE"]) if "TENURE" in df.columns and df["TENURE"].notna().any() else 2.0, 0.0, 40.0))
     default_hours = float(clamp(np.nanmedian(df["HRS_WRK"]) if "HRS_WRK" in df.columns and df["HRS_WRK"].notna().any() else 40.0, 1.0, 120.0))
-    default_prior_wage = float(clamp(np.nanmedian(df_lag["prior_wage"]) if len(df_lag) > 0 else 25.0, 0.5, 500.0))
+    default_prior_wage = float(clamp(np.nanmedian(df_lag["prior_wage"]) if len(df_lag) > 0 and "prior_wage" in df_lag.columns else 25.0, 0.5, 500.0))
 
-    occ_choices = sorted(df["Occupation_Group2"].dropna().unique().tolist())
-    ind_choices = sorted(df["Industry_Group"].dropna().unique().tolist())
-    race_choices = sorted(df["race_label"].dropna().unique().tolist())
-    region_choices = sorted(df["region_label"].dropna().unique().tolist())
-    marital_choices = sorted(df["marital_status"].dropna().unique().tolist())
+    occ_choices = sorted(df["Occupation_Group2"].dropna().unique().tolist()) if "Occupation_Group2" in df.columns else []
+    ind_choices = sorted(df["Industry_Group"].dropna().unique().tolist()) if "Industry_Group" in df.columns else []
+    race_choices = sorted(df["race_label"].dropna().unique().tolist()) if "race_label" in df.columns else []
+    region_choices = sorted(df["region_label"].dropna().unique().tolist()) if "region_label" in df.columns else []
+    marital_choices = sorted(df["marital_status"].dropna().unique().tolist()) if "marital_status" in df.columns else []
+
+    if not occ_choices:
+        occ_choices = ["Unknown"]
+    if not ind_choices:
+        ind_choices = ["Unknown"]
+    if not race_choices:
+        race_choices = ["Unknown"]
+    if not region_choices:
+        region_choices = ["Unknown"]
+    if not marital_choices:
+        marital_choices = [-1]
 
     with st.form("simulator_form"):
         f1, f2, f3 = st.columns(3)
@@ -1092,11 +1197,11 @@ elif page == "AI Wage Simulator":
                 step=1
             )
             sim_sex = st.selectbox("Gender", ["Male", "Female"], index=1)
-            sim_race = st.selectbox("Race", race_choices, index=0 if len(race_choices) > 0 else 0)
-            sim_region = st.selectbox("Region", region_choices, index=0 if len(region_choices) > 0 else 0)
+            sim_race = safe_selectbox("Race", race_choices, default_index=0, key="sim_race")
+            sim_region = safe_selectbox("Region", region_choices, default_index=0, key="sim_region")
 
         with f2:
-            sim_marital = st.selectbox("Marital status code", marital_choices, index=0 if len(marital_choices) > 0 else 0)
+            sim_marital = safe_selectbox("Marital status code", marital_choices, default_index=0, key="sim_marital")
             sim_age = st.number_input("Age", min_value=18, max_value=70, value=int(clamp(default_age, 18, 70)), step=1)
             sim_hgc = st.number_input("Education (HGC)", min_value=0.0, max_value=25.0, value=float(clamp(default_hgc, 0.0, 25.0)), step=0.5)
             sim_tenure = st.number_input("Tenure", min_value=0.0, max_value=40.0, value=float(clamp(default_tenure, 0.0, 40.0)), step=0.5)
@@ -1104,8 +1209,8 @@ elif page == "AI Wage Simulator":
         with f3:
             sim_hours = st.number_input("Weekly hours worked", min_value=1.0, max_value=120.0, value=float(clamp(default_hours, 1.0, 120.0)), step=1.0)
             sim_prior_wage = st.number_input("Prior wage", min_value=0.5, max_value=500.0, value=float(clamp(default_prior_wage, 0.5, 500.0)), step=0.5)
-            sim_occ = st.selectbox("Occupation group", occ_choices, index=0 if len(occ_choices) > 0 else 0)
-            sim_ind = st.selectbox("Industry group", ind_choices, index=0 if len(ind_choices) > 0 else 0)
+            sim_occ = safe_selectbox("Occupation group", occ_choices, default_index=0, key="sim_occ")
+            sim_ind = safe_selectbox("Industry group", ind_choices, default_index=0, key="sim_ind")
 
         forecast_model_choice = st.selectbox(
             "Projection model",
@@ -1121,15 +1226,15 @@ elif page == "AI Wage Simulator":
         base_inputs = {
             "year_value": int(sim_year),
             "sex_label": sim_sex,
-            "race_label": sim_race,
-            "region_label": sim_region,
-            "marital_status": sim_marital,
+            "race_label": sim_race if sim_race is not None else "Unknown",
+            "region_label": sim_region if sim_region is not None else "Unknown",
+            "marital_status": sim_marital if sim_marital is not None else -1,
             "age": float(sim_age),
             "hgc": float(sim_hgc),
             "tenure": float(sim_tenure),
             "hrs_wrk": float(sim_hours),
-            "occupation_group": sim_occ,
-            "industry_group": sim_ind,
+            "occupation_group": sim_occ if sim_occ is not None else "Unknown",
+            "industry_group": sim_ind if sim_ind is not None else "Unknown",
             "prior_wage": float(sim_prior_wage)
         }
 
