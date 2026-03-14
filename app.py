@@ -25,7 +25,7 @@ warnings.filterwarnings("ignore")
 # Page config
 # -----------------------------
 st.set_page_config(
-    page_title="Datathon 2026 Dashboard",
+    page_title="Datathon 2026 Dashboard Team #18",
     page_icon="📊",
     layout="wide"
 )
